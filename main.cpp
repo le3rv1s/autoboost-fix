@@ -28,6 +28,7 @@ constexpr ULONG kThreadInfoPriorityBoost = 14;
 using NtQuerySystemInformation_t = NTSTATUS(NTAPI*)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 using NtOpenThread_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, CLIENT_ID*);
 using NtSetInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, THREADINFOCLASS, PVOID, ULONG);
+using NtQueryInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
 
 struct UNDOC_SYSTEM_THREAD_INFORMATION {
     LARGE_INTEGER KernelTime;
@@ -66,6 +67,7 @@ struct NtApi {
     NtQuerySystemInformation_t querySystemInformation = nullptr;
     NtOpenThread_t openThread = nullptr;
     NtSetInformationThread_t setInformationThread = nullptr;
+    NtQueryInformationThread_t queryInformationThread = nullptr;
 };
 
 struct ThreadFixStats {
@@ -137,8 +139,10 @@ static bool LoadNtApi(NtApi& nt) {
     nt.openThread = reinterpret_cast<NtOpenThread_t>(GetProcAddress(ntdll, "NtOpenThread"));
     nt.setInformationThread = reinterpret_cast<NtSetInformationThread_t>(
         GetProcAddress(ntdll, "NtSetInformationThread"));
+    nt.queryInformationThread = reinterpret_cast<NtQueryInformationThread_t>(
+        GetProcAddress(ntdll, "NtQueryInformationThread"));
 
-    return nt.querySystemInformation && nt.openThread && nt.setInformationThread;
+    return nt.querySystemInformation && nt.openThread && nt.setInformationThread && nt.queryInformationThread;
 }
 
 static std::unique_ptr<std::byte[]> QuerySystemProcessBuffer(const NtApi& nt, ULONG& outSize) {
@@ -247,6 +251,24 @@ static void PrintThreadLine(DWORD tid,
                  fixed ? L"fixed" : L"failed");
 }
 
+
+static bool QueryLiveThreadPriorities(const NtApi& nt, HANDLE threadHandle, KPRIORITY& outPriority, KPRIORITY& outBasePriority) {
+    THREAD_BASIC_INFORMATION tbi{};
+    NTSTATUS status = nt.queryInformationThread(
+        threadHandle,
+        static_cast<THREADINFOCLASS>(0),
+        reinterpret_cast<PVOID>(&tbi),
+        static_cast<ULONG>(sizeof(tbi)),
+        nullptr);
+    if (!NT_SUCCESS(status)) {
+        return false;
+    }
+
+    outPriority = static_cast<KPRIORITY>(tbi.Priority);
+    outBasePriority = static_cast<KPRIORITY>(tbi.BasePriority);
+    return true;
+}
+
 static ThreadFixStats FixProcessThreads(const NtApi& nt,
                                         UNDOC_SYSTEM_PROCESS_INFORMATION* proc) {
     ThreadFixStats stats{};
@@ -255,16 +277,6 @@ static ThreadFixStats FixProcessThreads(const NtApi& nt,
     for (ULONG i = 0; i < proc->NumberOfThreads; ++i) {
         const auto& t = proc->Threads[i];
         ++stats.visited;
-
-        if (!IsAutoboostStuckRange(t.Priority)) {
-            continue;
-        }
-
-        if (t.Priority <= t.BasePriority) {
-            continue;
-        }
-
-        ++stats.candidates;
 
         HANDLE threadHandle = nullptr;
         CLIENT_ID cid{t.ClientId.UniqueProcess, t.ClientId.UniqueThread};
@@ -285,14 +297,24 @@ static ThreadFixStats FixProcessThreads(const NtApi& nt,
             continue;
         }
 
-        const bool fixed = ApplyPriorityFix(nt, threadHandle, processBase, t.BasePriority, stats);
+        KPRIORITY livePriority = t.Priority;
+        KPRIORITY liveBasePriority = t.BasePriority;
+        QueryLiveThreadPriorities(nt, threadHandle, livePriority, liveBasePriority);
+
+        if (!IsAutoboostStuckRange(livePriority) || livePriority <= liveBasePriority) {
+            CloseHandle(threadHandle);
+            continue;
+        }
+
+        ++stats.candidates;
+        const bool fixed = ApplyPriorityFix(nt, threadHandle, processBase, liveBasePriority, stats);
         if (fixed) {
             ++stats.fixed;
         }
 
         PrintThreadLine(static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(t.ClientId.UniqueThread)),
-                        t.Priority,
-                        t.BasePriority,
+                        livePriority,
+                        liveBasePriority,
                         processBase,
                         fixed);
 
@@ -307,7 +329,7 @@ static void PrintSummary(const ThreadFixStats& s) {
     std::wprintf(L"  threads visited      : %lu\n", s.visited);
     std::wprintf(L"  candidates [16..31]  : %lu\n", s.candidates);
     std::wprintf(L"  fixed                : %lu\n", s.fixed);
-    std::wprintf(L"  NtSet static_cast<THREADINFOCLASS>(kThreadInfoPriority) : %lu\n", s.ntSetPriorityOk);
+    std::wprintf(L"  NtSet ThreadPriority : %lu\n", s.ntSetPriorityOk);
     std::wprintf(L"  NtSet BasePriority   : %lu\n", s.ntSetBaseOk);
     std::wprintf(L"  Win32 fallback       : %lu\n", s.win32FallbackOk);
     std::wprintf(L"  open failures        : %lu\n", s.openFailed);
