@@ -92,11 +92,20 @@ static SYSTEM_PROCESS_INFORMATION* FindProcessByPid(std::byte* raw, DWORD pid) {
 
 static std::vector<DWORD> CollectThreadIds(const SYSTEM_PROCESS_INFORMATION* spi) {
     std::vector<DWORD> tids;
+    if (!spi) return tids;
+
     tids.reserve(spi->NumberOfThreads);
+
+    const auto* threads = reinterpret_cast<const SYSTEM_THREAD_INFORMATION*>(
+        reinterpret_cast<const std::byte*>(spi) + sizeof(SYSTEM_PROCESS_INFORMATION));
+
     for (ULONG i = 0; i < spi->NumberOfThreads; ++i) {
-        auto tid = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(spi->Threads[i].ClientId.UniqueThread));
-        if (tid != 0) tids.push_back(tid);
+        DWORD threadId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(threads[i].ClientId.UniqueThread));
+        if (threadId != 0) {
+            tids.push_back(threadId);
+        }
     }
+
     return tids;
 }
 
