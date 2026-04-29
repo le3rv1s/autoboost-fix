@@ -85,7 +85,7 @@ static bool IsCandidate(KPRIORITY dyn, KPRIORITY base) {
     return dyn >= 16 && dyn <= 31 && dyn > base;
 }
 
-static bool FixOne(const NtApi& nt, DWORD pid, DWORD tid, KPRIORITY processBase, KPRIORITY threadBase) {
+static bool FixOne(const NtApi& nt, DWORD pid, DWORD tid, KPRIORITY processBase, KPRIORITY snapshotBase) {
     HANDLE hThread = nullptr;
     CLIENT_ID cid{};
     cid.UniqueProcess = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid));
@@ -96,36 +96,24 @@ static bool FixOne(const NtApi& nt, DWORD pid, DWORD tid, KPRIORITY processBase,
     NTSTATUS openSt = nt.openThread(&hThread, THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, &oa, &cid);
     if (!NT_SUCCESS(openSt) || !hThread) return false;
 
-    KPRIORITY dyn = 0;
-    KPRIORITY base = 0;
-    if (!QueryLive(nt, hThread, dyn, base)) {
-        CloseHandle(hThread);
-        return false;
-    }
-
-    if (!IsCandidate(dyn, base)) {
-        CloseHandle(hThread);
-        return false;
-    }
 
     ULONG disableBoost = 0;
     nt.setInformationThread(hThread, static_cast<THREADINFOCLASS>(kThreadInfoPriorityBoost), &disableBoost, sizeof(disableBoost));
 
-    LONG relativeBase = static_cast<LONG>(threadBase) - static_cast<LONG>(processBase);
+    LONG relativeBase = static_cast<LONG>(snapshotBase) - static_cast<LONG>(processBase);
     if (relativeBase < -2) relativeBase = -2;
     if (relativeBase > 2) relativeBase = 2;
 
     bool ok = false;
     ok |= NT_SUCCESS(nt.setInformationThread(hThread, static_cast<THREADINFOCLASS>(kThreadInfoBasePriority), &relativeBase, sizeof(relativeBase)));
 
-    KPRIORITY absTarget = threadBase;
+    KPRIORITY absTarget = snapshotBase;
     if (absTarget < 1) absTarget = 1;
     if (absTarget > 15) absTarget = 15;
     ok |= NT_SUCCESS(nt.setInformationThread(hThread, static_cast<THREADINFOCLASS>(kThreadInfoPriority), &absTarget, sizeof(absTarget)));
 
     CloseHandle(hThread);
     if (ok) {
-        std::wprintf(L"FIX pid=%lu tid=%lu dyn=%ld base=%ld\n", pid, tid, static_cast<LONG>(dyn), static_cast<LONG>(base));
     }
     return ok;
 }
@@ -137,12 +125,14 @@ int wmain() {
         return 1;
     }
 
-    std::wprintf(L"monitor mode: adaptive NT scan (500..3000ms)\n");
+    std::wprintf(L"monitor mode: low-overhead NT scan (1000..5000ms)\n");
 
     ULONG idleTicks = 0;
     LONGLONG interval100ns = -10'000'000LL;
 
     while (true) {
+        static ULONG tick = 0;
+        ++tick;
         ULONG scannedThreads = 0;
         ULONG candidates = 0;
         ULONG fixed = 0;
@@ -175,15 +165,18 @@ int wmain() {
 
         if (candidates > 0 || fixed > 0) {
             idleTicks = 0;
-            interval100ns = -5'000'000LL; // 500ms when active
-            std::wprintf(L"active scanned=%lu candidates=%lu fixed=%lu\n", scannedThreads, candidates, fixed);
+            interval100ns = -10'000'000LL; // 1s when active
         } else {
             ++idleTicks;
             if (idleTicks > 30) {
-                interval100ns = -30'000'000LL; // 3s deep idle
+                interval100ns = -50'000'000LL; // 5s deep idle
             } else {
                 interval100ns = -10'000'000LL; // 1s normal idle
             }
+        }
+
+        if ((tick % 20) == 0) {
+            std::wprintf(L"status scanned=%lu candidates=%lu fixed=%lu idleTicks=%lu\n", scannedThreads, candidates, fixed, idleTicks);
         }
 
         LARGE_INTEGER interval{};
