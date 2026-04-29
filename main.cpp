@@ -20,17 +20,9 @@
 #define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
 #endif
 
-#ifndef ThreadPriority
-constexpr THREADINFOCLASS ThreadPriority = static_cast<THREADINFOCLASS>(2);
-#endif
-
-#ifndef ThreadBasePriority
-constexpr THREADINFOCLASS ThreadBasePriority = static_cast<THREADINFOCLASS>(3);
-#endif
-
-#ifndef ThreadPriorityBoost
-constexpr THREADINFOCLASS ThreadPriorityBoost = static_cast<THREADINFOCLASS>(14);
-#endif
+constexpr THREADINFOCLASS kThreadInfoPriority = static_cast<THREADINFOCLASS>(2);
+constexpr THREADINFOCLASS kThreadInfoBasePriority = static_cast<THREADINFOCLASS>(3);
+constexpr THREADINFOCLASS kThreadInfoPriorityBoost = static_cast<THREADINFOCLASS>(14);
 
 using NtQuerySystemInformation_t = NTSTATUS(NTAPI*)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 using NtOpenThread_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, CLIENT_ID*);
@@ -195,24 +187,24 @@ static bool ApplyPriorityFix(const NtApi& nt,
                              KPRIORITY threadBase,
                              ThreadFixStats& stats) {
     ULONG disableBoost = 0;
-    nt.setInformationThread(threadHandle, ThreadPriorityBoost, &disableBoost, sizeof(disableBoost));
+    nt.setInformationThread(threadHandle, kThreadInfoPriorityBoost, reinterpret_cast<PVOID>(&disableBoost), sizeof(disableBoost));
 
     bool anySetWorked = false;
 
-    const LONG relativeNtBase = ComputeRelativeBaseForNt(processBase, threadBase);
-    if (NT_SUCCESS(nt.setInformationThread(threadHandle, ThreadBasePriority, &relativeNtBase, sizeof(relativeNtBase)))) {
+    LONG relativeNtBase = ComputeRelativeBaseForNt(processBase, threadBase);
+    if (NT_SUCCESS(nt.setInformationThread(threadHandle, kThreadInfoBasePriority, reinterpret_cast<PVOID>(&relativeNtBase), sizeof(relativeNtBase)))) {
         anySetWorked = true;
         ++stats.ntSetBaseOk;
     }
 
-    KPRIORITY absoluteTarget = ClampLong(threadBase, 1, 15);
-    if (NT_SUCCESS(nt.setInformationThread(threadHandle, ThreadPriority, &absoluteTarget, sizeof(absoluteTarget)))) {
+    KPRIORITY absoluteTarget = static_cast<KPRIORITY>(ClampLong(threadBase, 1, 15));
+    if (NT_SUCCESS(nt.setInformationThread(threadHandle, kThreadInfoPriority, reinterpret_cast<PVOID>(&absoluteTarget), sizeof(absoluteTarget)))) {
         anySetWorked = true;
         ++stats.ntSetPriorityOk;
     }
 
     if (!anySetWorked) {
-        const int relativeWin32 = ClampWin32RelativePriorityFromBase(processBase, threadBase);
+        int relativeWin32 = ClampWin32RelativePriorityFromBase(processBase, threadBase);
         if (SetThreadPriority(threadHandle, relativeWin32) != 0) {
             anySetWorked = true;
             ++stats.win32FallbackOk;
@@ -312,7 +304,7 @@ static void PrintSummary(const ThreadFixStats& s) {
     std::wprintf(L"  threads visited      : %lu\n", s.visited);
     std::wprintf(L"  candidates [16..31]  : %lu\n", s.candidates);
     std::wprintf(L"  fixed                : %lu\n", s.fixed);
-    std::wprintf(L"  NtSet ThreadPriority : %lu\n", s.ntSetPriorityOk);
+    std::wprintf(L"  NtSet kThreadInfoPriority : %lu\n", s.ntSetPriorityOk);
     std::wprintf(L"  NtSet BasePriority   : %lu\n", s.ntSetBaseOk);
     std::wprintf(L"  Win32 fallback       : %lu\n", s.win32FallbackOk);
     std::wprintf(L"  open failures        : %lu\n", s.openFailed);
