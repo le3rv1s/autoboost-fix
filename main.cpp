@@ -63,6 +63,18 @@ struct UNDOC_SYSTEM_PROCESS_INFORMATION {
     UNDOC_SYSTEM_THREAD_INFORMATION Threads[1];
 };
 
+
+#ifndef HAVE_THREAD_BASIC_INFORMATION_LOCAL
+typedef struct _LOCAL_THREAD_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    PVOID TebBaseAddress;
+    CLIENT_ID ClientId;
+    KAFFINITY AffinityMask;
+    KPRIORITY Priority;
+    KPRIORITY BasePriority;
+} LOCAL_THREAD_BASIC_INFORMATION;
+#endif
+
 struct NtApi {
     NtQuerySystemInformation_t querySystemInformation = nullptr;
     NtOpenThread_t openThread = nullptr;
@@ -253,7 +265,7 @@ static void PrintThreadLine(DWORD tid,
 
 
 static bool QueryLiveThreadPriorities(const NtApi& nt, HANDLE threadHandle, KPRIORITY& outPriority, KPRIORITY& outBasePriority) {
-    THREAD_BASIC_INFORMATION tbi{};
+    LOCAL_THREAD_BASIC_INFORMATION tbi{};
     NTSTATUS status = nt.queryInformationThread(
         threadHandle,
         static_cast<THREADINFOCLASS>(0),
