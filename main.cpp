@@ -59,16 +59,17 @@ struct UNDOC_SYSTEM_PROCESS_INFORMATION {
 };
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc < 2) {
-        std::wprintf(L"Usage: autoboost_fix_nt.exe <pid>\n");
-        return 1;
+    DWORD pid = 11692;
+    if (argc >= 2) {
+        pid = static_cast<DWORD>(_wtoi(argv[1]));
     }
 
-    const DWORD pid = static_cast<DWORD>(_wtoi(argv[1]));
     if (pid == 0) {
         std::wprintf(L"Invalid PID.\n");
         return 1;
     }
+
+    std::wprintf(L"Target PID: %lu\n", pid);
 
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) {
