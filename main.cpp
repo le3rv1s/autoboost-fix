@@ -1,14 +1,18 @@
 #define NOMINMAX
 #include <windows.h>
 #include <winternl.h>
-#include <tlhelp32.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <vector>
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
+
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
 #endif
 
 constexpr ULONG kThreadInfoPriority = 2;
@@ -19,6 +23,7 @@ constexpr THREADINFOCLASS kThreadBasicInformationClass = static_cast<THREADINFOC
 using NtOpenThread_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, CLIENT_ID*);
 using NtSetInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, THREADINFOCLASS, PVOID, ULONG);
 using NtQueryInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
+using NtQuerySystemInformation_t = NTSTATUS(NTAPI*)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 
 typedef struct _LOCAL_THREAD_BASIC_INFORMATION {
     NTSTATUS ExitStatus;
@@ -33,6 +38,7 @@ struct NtApi {
     NtOpenThread_t openThread = nullptr;
     NtSetInformationThread_t setInformationThread = nullptr;
     NtQueryInformationThread_t queryInformationThread = nullptr;
+    NtQuerySystemInformation_t querySystemInformation = nullptr;
 };
 
 struct Stats {
@@ -49,25 +55,48 @@ static bool LoadNtApi(NtApi& nt) {
     nt.openThread = reinterpret_cast<NtOpenThread_t>(GetProcAddress(ntdll, "NtOpenThread"));
     nt.setInformationThread = reinterpret_cast<NtSetInformationThread_t>(GetProcAddress(ntdll, "NtSetInformationThread"));
     nt.queryInformationThread = reinterpret_cast<NtQueryInformationThread_t>(GetProcAddress(ntdll, "NtQueryInformationThread"));
-    return nt.openThread && nt.setInformationThread && nt.queryInformationThread;
+    nt.querySystemInformation = reinterpret_cast<NtQuerySystemInformation_t>(GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    return nt.openThread && nt.setInformationThread && nt.queryInformationThread && nt.querySystemInformation;
 }
 
-static std::vector<DWORD> EnumerateThreadIdsForProcess(DWORD pid) {
-    std::vector<DWORD> tids;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return tids;
+static std::unique_ptr<std::byte[]> QuerySystemProcessBuffer(const NtApi& nt) {
+    ULONG size = 1 << 20;
+    ULONG retLen = 0;
+    NTSTATUS st;
+    std::unique_ptr<std::byte[]> buffer;
 
-    THREADENTRY32 te{};
-    te.dwSize = sizeof(te);
-    if (Thread32First(snap, &te)) {
-        do {
-            if (te.th32OwnerProcessID == pid) {
-                tids.push_back(te.th32ThreadID);
-            }
-        } while (Thread32Next(snap, &te));
+    do {
+        buffer.reset(new std::byte[size]);
+        st = nt.querySystemInformation(SystemProcessInformation, buffer.get(), size, &retLen);
+        if (st == STATUS_INFO_LENGTH_MISMATCH) {
+            ULONG grown = size + (1 << 20);
+            ULONG required = retLen + (1 << 16);
+            size = (grown > required) ? grown : required;
+        }
+    } while (st == STATUS_INFO_LENGTH_MISMATCH);
+
+    if (!NT_SUCCESS(st)) return nullptr;
+    return buffer;
+}
+
+static SYSTEM_PROCESS_INFORMATION* FindProcessByPid(std::byte* raw, DWORD pid) {
+    auto* spi = reinterpret_cast<SYSTEM_PROCESS_INFORMATION*>(raw);
+    while (spi) {
+        DWORD currentPid = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(spi->UniqueProcessId));
+        if (currentPid == pid) return spi;
+        if (spi->NextEntryOffset == 0) break;
+        spi = reinterpret_cast<SYSTEM_PROCESS_INFORMATION*>(reinterpret_cast<std::byte*>(spi) + spi->NextEntryOffset);
     }
+    return nullptr;
+}
 
-    CloseHandle(snap);
+static std::vector<DWORD> CollectThreadIds(const SYSTEM_PROCESS_INFORMATION* spi) {
+    std::vector<DWORD> tids;
+    tids.reserve(spi->NumberOfThreads);
+    for (ULONG i = 0; i < spi->NumberOfThreads; ++i) {
+        auto tid = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(spi->Threads[i].ClientId.UniqueThread));
+        if (tid != 0) tids.push_back(tid);
+    }
     return tids;
 }
 
@@ -129,11 +158,9 @@ static bool FixThread(const NtApi& nt, HANDLE hThread, KPRIORITY processBase, KP
 
 int wmain(int argc, wchar_t** argv) {
     DWORD pid = 11692;
-    if (argc >= 2) {
-        pid = static_cast<DWORD>(_wtoi(argv[1]));
-    }
+    if (argc >= 2) pid = static_cast<DWORD>(_wtoi(argv[1]));
 
-    std::wprintf(L"autoboost_fix_nt (live NtQueryInformationThread mode)\n");
+    std::wprintf(L"autoboost_fix_nt (NT-only enumeration mode)\n");
     std::wprintf(L"Target PID: %lu\n", pid);
 
     NtApi nt{};
@@ -159,9 +186,21 @@ int wmain(int argc, wchar_t** argv) {
     if (prioClass == HIGH_PRIORITY_CLASS) processBase = 13;
     if (prioClass == REALTIME_PRIORITY_CLASS) processBase = 24;
 
-    auto tids = EnumerateThreadIdsForProcess(pid);
+    auto buffer = QuerySystemProcessBuffer(nt);
+    if (!buffer) {
+        std::wprintf(L"NtQuerySystemInformation(SystemProcessInformation) failed\n");
+        return 2;
+    }
+
+    SYSTEM_PROCESS_INFORMATION* spi = FindProcessByPid(buffer.get(), pid);
+    if (!spi) {
+        std::wprintf(L"PID %lu not found in NT snapshot\n", pid);
+        return 2;
+    }
+
+    std::vector<DWORD> tids = CollectThreadIds(spi);
     if (tids.empty()) {
-        std::wprintf(L"No threads found for PID %lu\n", pid);
+        std::wprintf(L"No threads found in NT snapshot for PID %lu\n", pid);
         return 2;
     }
 
@@ -169,6 +208,7 @@ int wmain(int argc, wchar_t** argv) {
     for (DWORD tid : tids) {
         ++stats.visited;
         HANDLE hThread = nullptr;
+
         CLIENT_ID cid{};
         cid.UniqueProcess = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(pid));
         cid.UniqueThread = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(tid));
