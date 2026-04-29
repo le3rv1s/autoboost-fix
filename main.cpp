@@ -1,3 +1,4 @@
+#define NOMINMAX
 #include <windows.h>
 #include <winternl.h>
 
@@ -150,7 +151,9 @@ static std::unique_ptr<std::byte[]> QuerySystemProcessBuffer(const NtApi& nt, UL
         buffer.reset(new std::byte[size]);
         status = nt.querySystemInformation(SystemProcessInformation, buffer.get(), size, &needed);
         if (status == STATUS_INFO_LENGTH_MISMATCH) {
-            size = std::max(size + (1 << 20), needed + (1 << 16));
+            ULONG grown = size + (1 << 20);
+            ULONG required = needed + (1 << 16);
+            size = (grown > required) ? grown : required;
         }
     } while (status == STATUS_INFO_LENGTH_MISMATCH);
 
