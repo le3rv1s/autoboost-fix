@@ -1,21 +1,29 @@
 #include <windows.h>
 #include <winternl.h>
 
-#include <cstdint>
+#include <cstddef>
 #include <cstdio>
-#include <cstring>
 #include <memory>
-#include <string>
-#include <vector>
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #endif
 
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+#endif
+
+#ifndef ThreadPriority
+constexpr THREADINFOCLASS ThreadPriority = static_cast<THREADINFOCLASS>(2);
+#endif
+
+#ifndef ThreadPriorityBoost
+constexpr THREADINFOCLASS ThreadPriorityBoost = static_cast<THREADINFOCLASS>(14);
+#endif
+
 using NtQuerySystemInformation_t = NTSTATUS(NTAPI*)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-using NtOpenThread_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
+using NtOpenThread_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, CLIENT_ID*);
 using NtSetInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, THREADINFOCLASS, PVOID, ULONG);
-using NtQueryInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
 
 struct UNDOC_SYSTEM_THREAD_INFORMATION {
     LARGE_INTEGER KernelTime;
@@ -50,14 +58,6 @@ struct UNDOC_SYSTEM_PROCESS_INFORMATION {
     UNDOC_SYSTEM_THREAD_INFORMATION Threads[1];
 };
 
-static std::wstring ToWide(const char* arg) {
-    const int len = MultiByteToWideChar(CP_UTF8, 0, arg, -1, nullptr, 0);
-    if (len <= 0) return L"";
-    std::wstring result(static_cast<size_t>(len - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, arg, -1, result.data(), len);
-    return result;
-}
-
 int wmain(int argc, wchar_t** argv) {
     if (argc < 2) {
         std::wprintf(L"Usage: autoboost_fix_nt.exe <pid>\n");
@@ -76,12 +76,13 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 
-    auto NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformation_t>(GetProcAddress(ntdll, "NtQuerySystemInformation"));
-    auto NtOpenThread = reinterpret_cast<NtOpenThread_t>(GetProcAddress(ntdll, "NtOpenThread"));
-    auto NtSetInformationThread = reinterpret_cast<NtSetInformationThread_t>(GetProcAddress(ntdll, "NtSetInformationThread"));
-    auto NtQueryInformationThread = reinterpret_cast<NtQueryInformationThread_t>(GetProcAddress(ntdll, "NtQueryInformationThread"));
+    const auto NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformation_t>(
+        GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    const auto NtOpenThread = reinterpret_cast<NtOpenThread_t>(GetProcAddress(ntdll, "NtOpenThread"));
+    const auto NtSetInformationThread = reinterpret_cast<NtSetInformationThread_t>(
+        GetProcAddress(ntdll, "NtSetInformationThread"));
 
-    if (!NtQuerySystemInformation || !NtOpenThread || !NtSetInformationThread || !NtQueryInformationThread) {
+    if (!NtQuerySystemInformation || !NtOpenThread || !NtSetInformationThread) {
         std::wprintf(L"Failed to resolve NT functions.\n");
         return 1;
     }
@@ -119,12 +120,15 @@ int wmain(int argc, wchar_t** argv) {
                 OBJECT_ATTRIBUTES oa{};
                 InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
 
-                if (!NT_SUCCESS(NtOpenThread(&threadHandle, THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, &oa, &cid))) {
+                if (!NT_SUCCESS(NtOpenThread(&threadHandle,
+                                             THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION,
+                                             &oa,
+                                             &cid))) {
                     continue;
                 }
 
                 ULONG boostDisabled = 1;
-                NtSetInformationThread(threadHandle, static_cast<THREADINFOCLASS>(ThreadPriorityBoost), &boostDisabled, sizeof(boostDisabled));
+                NtSetInformationThread(threadHandle, ThreadPriorityBoost, &boostDisabled, sizeof(boostDisabled));
 
                 KPRIORITY targetPrio = t.BasePriority;
                 if (targetPrio < 1) targetPrio = 1;
@@ -132,7 +136,10 @@ int wmain(int argc, wchar_t** argv) {
 
                 if (NT_SUCCESS(NtSetInformationThread(threadHandle, ThreadPriority, &targetPrio, sizeof(targetPrio)))) {
                     ++fixed;
-                    std::wprintf(L"TID %5lu: %2ld -> %2ld\n", static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(t.ClientId.UniqueThread)), t.Priority, targetPrio);
+                    std::wprintf(L"TID %5lu: %2ld -> %2ld\n",
+                                 static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(t.ClientId.UniqueThread)),
+                                 t.Priority,
+                                 targetPrio);
                 }
 
                 CloseHandle(threadHandle);
