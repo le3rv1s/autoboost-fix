@@ -118,6 +118,36 @@ static bool FixOne(const NtApi& nt, DWORD pid, DWORD tid, KPRIORITY processBase,
     return ok;
 }
 
+
+static std::vector<ThreadSnapshotEntry> BuildThreadCache(const NtApi& nt) {
+    std::vector<ThreadSnapshotEntry> out;
+    auto snap = QuerySnapshot(nt);
+    if (!snap) return out;
+
+    auto* spi = reinterpret_cast<SYSTEM_PROCESS_INFORMATION*>(snap.get());
+    while (spi) {
+        KPRIORITY processBase = spi->BasePriority;
+        DWORD pid = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(spi->UniqueProcessId));
+        const auto* threads = reinterpret_cast<const SYSTEM_THREAD_INFORMATION*>(
+            reinterpret_cast<const std::byte*>(spi) + sizeof(SYSTEM_PROCESS_INFORMATION));
+
+        for (ULONG i = 0; i < spi->NumberOfThreads; ++i) {
+            ThreadSnapshotEntry e{};
+            e.pid = pid;
+            e.tid = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(threads[i].ClientId.UniqueThread));
+            e.processBase = processBase;
+            e.dyn = threads[i].Priority;
+            e.base = threads[i].BasePriority;
+            if (e.pid != 0 && e.tid != 0) out.push_back(e);
+        }
+
+        if (spi->NextEntryOffset == 0) break;
+        spi = reinterpret_cast<SYSTEM_PROCESS_INFORMATION*>(reinterpret_cast<std::byte*>(spi) + spi->NextEntryOffset);
+    }
+
+    return out;
+}
+
 int wmain() {
     NtApi nt{};
     if (!LoadNtApi(nt)) {
@@ -130,53 +160,48 @@ int wmain() {
     ULONG idleTicks = 0;
     LONGLONG interval100ns = -10'000'000LL;
 
+    std::vector<ThreadSnapshotEntry> cache;
+    size_t cursor = 0;
+    ULONG ticksFromRefresh = 1000;
+
     while (true) {
         static ULONG tick = 0;
         ++tick;
+        if (ticksFromRefresh >= 10 || cache.empty()) {
+            cache = BuildThreadCache(nt); // refresh ~every 10 ticks
+            cursor = 0;
+            ticksFromRefresh = 0;
+        }
+        ++ticksFromRefresh;
+
         ULONG scannedThreads = 0;
         ULONG candidates = 0;
         ULONG fixed = 0;
 
-        auto snap = QuerySnapshot(nt);
-        if (snap) {
-            auto* spi = reinterpret_cast<SYSTEM_PROCESS_INFORMATION*>(snap.get());
-            while (spi) {
-                KPRIORITY processBase = spi->BasePriority;
-                const auto* threads = reinterpret_cast<const SYSTEM_THREAD_INFORMATION*>(
-                    reinterpret_cast<const std::byte*>(spi) + sizeof(SYSTEM_PROCESS_INFORMATION));
-
-                DWORD pid = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(spi->UniqueProcessId));
-                for (ULONG i = 0; i < spi->NumberOfThreads; ++i) {
-                    ++scannedThreads;
-                    KPRIORITY dyn = threads[i].Priority;
-                    KPRIORITY base = threads[i].BasePriority;
-                    if (!IsCandidate(dyn, base)) continue;
-
-                    ++candidates;
-                    DWORD tid = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(threads[i].ClientId.UniqueThread));
-                    if (tid == 0 || pid == 0) continue;
-                    if (FixOne(nt, pid, tid, processBase, base)) ++fixed;
-                }
-
-                if (spi->NextEntryOffset == 0) break;
-                spi = reinterpret_cast<SYSTEM_PROCESS_INFORMATION*>(reinterpret_cast<std::byte*>(spi) + spi->NextEntryOffset);
-            }
+        const size_t kBudgetPerTick = 256;
+        size_t processed = 0;
+        while (!cache.empty() && processed < kBudgetPerTick) {
+            if (cursor >= cache.size()) cursor = 0;
+            const auto& e = cache[cursor++];
+            ++processed;
+            ++scannedThreads;
+            if (!IsCandidate(e.dyn, e.base)) continue;
+            ++candidates;
+            if (FixOne(nt, e.pid, e.tid, e.processBase, e.base)) ++fixed;
         }
 
         if (candidates > 0 || fixed > 0) {
             idleTicks = 0;
-            interval100ns = -10'000'000LL; // 1s when active
+            interval100ns = -10'000'000LL; // 1s active
         } else {
             ++idleTicks;
-            if (idleTicks > 30) {
-                interval100ns = -50'000'000LL; // 5s deep idle
-            } else {
-                interval100ns = -10'000'000LL; // 1s normal idle
-            }
+            if (idleTicks > 30) interval100ns = -50'000'000LL; // 5s
+            else interval100ns = -20'000'000LL; // 2s
         }
 
         if ((tick % 20) == 0) {
-            std::wprintf(L"status scanned=%lu candidates=%lu fixed=%lu idleTicks=%lu\n", scannedThreads, candidates, fixed, idleTicks);
+            std::wprintf(L"status cache=%zu scanned=%lu candidates=%lu fixed=%lu idleTicks=%lu\n",
+                         cache.size(), scannedThreads, candidates, fixed, idleTicks);
         }
 
         LARGE_INTEGER interval{};
