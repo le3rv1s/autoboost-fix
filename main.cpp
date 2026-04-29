@@ -137,7 +137,10 @@ int wmain() {
         return 1;
     }
 
-    std::wprintf(L"monitor mode: full system scan every 1000ms (NT-only)\n");
+    std::wprintf(L"monitor mode: adaptive NT scan (500..3000ms)\n");
+
+    ULONG idleTicks = 0;
+    LONGLONG interval100ns = -10'000'000LL;
 
     while (true) {
         ULONG scannedThreads = 0;
@@ -170,10 +173,21 @@ int wmain() {
             }
         }
 
-        std::wprintf(L"tick scanned=%lu candidates=%lu fixed=%lu\n", scannedThreads, candidates, fixed);
+        if (candidates > 0 || fixed > 0) {
+            idleTicks = 0;
+            interval100ns = -5'000'000LL; // 500ms when active
+            std::wprintf(L"active scanned=%lu candidates=%lu fixed=%lu\n", scannedThreads, candidates, fixed);
+        } else {
+            ++idleTicks;
+            if (idleTicks > 30) {
+                interval100ns = -30'000'000LL; // 3s deep idle
+            } else {
+                interval100ns = -10'000'000LL; // 1s normal idle
+            }
+        }
 
         LARGE_INTEGER interval{};
-        interval.QuadPart = -10'000'000LL; // 1s
+        interval.QuadPart = interval100ns;
         nt.delayExecution(FALSE, &interval);
     }
 }
