@@ -112,7 +112,7 @@ int wmain(int argc, wchar_t** argv) {
         if (static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(spi->UniqueProcessId)) == pid) {
             for (ULONG i = 0; i < spi->NumberOfThreads; ++i) {
                 const auto& t = spi->Threads[i];
-                if (t.Priority <= 15 || t.BasePriority >= t.Priority) {
+                if (t.BasePriority >= t.Priority) {
                     continue;
                 }
 
@@ -128,19 +128,25 @@ int wmain(int argc, wchar_t** argv) {
                     continue;
                 }
 
-                ULONG boostDisabled = 1;
+                ULONG boostDisabled = 0;
                 NtSetInformationThread(threadHandle, ThreadPriorityBoost, &boostDisabled, sizeof(boostDisabled));
 
                 KPRIORITY targetPrio = t.BasePriority;
                 if (targetPrio < 1) targetPrio = 1;
                 if (targetPrio > 15) targetPrio = 15;
 
-                if (NT_SUCCESS(NtSetInformationThread(threadHandle, ThreadPriority, &targetPrio, sizeof(targetPrio)))) {
+                bool fixedThisThread = NT_SUCCESS(
+                    NtSetInformationThread(threadHandle, ThreadPriority, &targetPrio, sizeof(targetPrio)));
+                if (!fixedThisThread) {
+                    fixedThisThread = SetThreadPriority(threadHandle, THREAD_PRIORITY_NORMAL) != 0;
+                }
+
+                if (fixedThisThread) {
                     ++fixed;
-                    std::wprintf(L"TID %5lu: %2ld -> %2ld\n",
+                    std::wprintf(L"TID %5lu: %2ld -> base %2ld\n",
                                  static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(t.ClientId.UniqueThread)),
                                  t.Priority,
-                                 targetPrio);
+                                 t.BasePriority);
                 }
 
                 CloseHandle(threadHandle);
