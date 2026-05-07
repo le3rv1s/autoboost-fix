@@ -26,6 +26,7 @@ struct UNICODE_STRING_T {
 constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH = static_cast<NTSTATUS_T>(0xC0000004L);
 constexpr ULONG SystemProcessInformation = 5;
 constexpr KPRIORITY kTargetPriority = 16;
+constexpr ULONG HEAP_GROWABLE = 0x00000002;
 constexpr uint32_t kDefaultIntervalMs = 1000;
 constexpr uint32_t kGlobalRefreshScans = 60;
 constexpr uint32_t kRetryCooldownScans = 256;
@@ -110,6 +111,7 @@ using RtlAllocateHeapFn = PVOID(NTAPI*)(PVOID, ULONG, SIZE_T);
 using RtlFreeHeapFn = BOOLEAN(NTAPI*)(PVOID, ULONG, PVOID);
 using RtlCreateHeapFn = PVOID(NTAPI*)(ULONG, PVOID, SIZE_T, SIZE_T, PVOID, PVOID);
 using RtlDestroyHeapFn = PVOID(NTAPI*)(PVOID);
+using RtlReAllocateHeapFn = PVOID(NTAPI*)(PVOID, ULONG, PVOID, SIZE_T);
 using NtOpenProcessTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, ACCESS_MASK, PHANDLE);
 using NtAdjustPrivilegesTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, BOOLEAN, PTOKEN_PRIVILEGES, ULONG, PTOKEN_PRIVILEGES, PULONG);
 using NtQueryInformationTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -273,29 +275,23 @@ static uint32_t ReadIntervalMs(int argc, wchar_t** argv) noexcept {
 
 static bool QueryProcessSnapshot(NtQuerySystemInformationFn query,
                                  RtlAllocateHeapFn allocateHeap,
-                                 RtlFreeHeapFn freeHeap,
+                                 RtlReAllocateHeapFn reallocateHeap,
                                  PVOID heap,
                                  PVOID& buffer,
                                  ULONG& capacity) noexcept {
     ULONG required = 0;
     NTSTATUS_T status = query(SystemProcessInformation, buffer, capacity, &required);
-    if (status == STATUS_INFO_LENGTH_MISMATCH) {
+    while (status == STATUS_INFO_LENGTH_MISMATCH) {
         const ULONG nextCapacity = required > capacity ? required + (64U * 1024U) : capacity * 2U;
-        PVOID nextBuffer = allocateHeap(heap, 0, nextCapacity);
+        PVOID nextBuffer = reallocateHeap(heap, 0, buffer, nextCapacity);
         if (nextBuffer == nullptr) {
             return false;
         }
 
-        status = query(SystemProcessInformation, nextBuffer, nextCapacity, &required);
-        if (status < 0) {
-            freeHeap(heap, 0, nextBuffer);
-            return false;
-        }
-
-        freeHeap(heap, 0, buffer);
         buffer = nextBuffer;
         capacity = nextCapacity;
-        return true;
+        required = 0;
+        status = query(SystemProcessInformation, buffer, capacity, &required);
     }
 
     return status >= 0;
@@ -410,7 +406,7 @@ static void RememberProcess(ProcessCache& cache,
 
 static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
                                        RtlAllocateHeapFn allocateHeap,
-                                       RtlFreeHeapFn freeHeap,
+                                       RtlReAllocateHeapFn reallocateHeap,
                                        PVOID heap,
                                        NtOpenThreadFn openThread,
                                        NtSetInformationThreadFn setThread,
@@ -423,7 +419,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
                                        ProcessCache& processCache,
                                        uint32_t scanId) noexcept {
     ScanStats stats{};
-    if (!QueryProcessSnapshot(query, allocateHeap, freeHeap, heap, buffer, capacity)) {
+    if (!QueryProcessSnapshot(query, allocateHeap, reallocateHeap, heap, buffer, capacity)) {
         return stats;
     }
 
@@ -567,6 +563,7 @@ int wmain(int argc, wchar_t** argv) {
 
     const auto allocateHeap = reinterpret_cast<RtlAllocateHeapFn>(GetProcAddress(ntdll, "RtlAllocateHeap"));
     const auto freeHeap = reinterpret_cast<RtlFreeHeapFn>(GetProcAddress(ntdll, "RtlFreeHeap"));
+    const auto reallocateHeap = reinterpret_cast<RtlReAllocateHeapFn>(GetProcAddress(ntdll, "RtlReAllocateHeap"));
     const auto createHeap = reinterpret_cast<RtlCreateHeapFn>(GetProcAddress(ntdll, "RtlCreateHeap"));
     const auto destroyHeap = reinterpret_cast<RtlDestroyHeapFn>(GetProcAddress(ntdll, "RtlDestroyHeap"));
     const auto openProcessToken = reinterpret_cast<NtOpenProcessTokenFn>(
@@ -580,7 +577,8 @@ int wmain(int argc, wchar_t** argv) {
         GetProcAddress(ntdll, "NtSetInformationProcess"));
     const auto closeHandle = reinterpret_cast<NtCloseFn>(GetProcAddress(ntdll, "NtClose"));
     const auto delayExecution = reinterpret_cast<NtDelayExecutionFn>(GetProcAddress(ntdll, "NtDelayExecution"));
-    if (allocateHeap == nullptr || freeHeap == nullptr || createHeap == nullptr || destroyHeap == nullptr ||
+    if (allocateHeap == nullptr || freeHeap == nullptr || reallocateHeap == nullptr ||
+        createHeap == nullptr || destroyHeap == nullptr ||
         openProcessToken == nullptr ||
         queryToken == nullptr || adjustToken == nullptr || openProcess == nullptr || setProcess == nullptr ||
         closeHandle == nullptr || delayExecution == nullptr) {
@@ -588,7 +586,7 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 
-    PVOID heap = createHeap(0, nullptr, 0, 0, nullptr, nullptr);
+    PVOID heap = createHeap(HEAP_GROWABLE, nullptr, 0, 0, nullptr, nullptr);
     if (heap == nullptr) {
         std::fputs("RtlCreateHeap failed\n", stderr);
         return 1;
@@ -610,8 +608,12 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 
-    ULONG capacity = 1024U * 1024U;
+    ULONG capacity = 256U * 1024U;
     PVOID buffer = allocateHeap(heap, 0, capacity);
+    if (buffer == nullptr) {
+        capacity = 64U * 1024U;
+        buffer = allocateHeap(heap, 0, capacity);
+    }
     if (buffer == nullptr) {
         std::fputs("failed to allocate snapshot buffer\n", stderr);
         destroyHeap(heap);
@@ -630,7 +632,7 @@ int wmain(int argc, wchar_t** argv) {
     do {
         const bool globalRefresh = intervalMs == 0 || scanId == 1 || (scanId % kGlobalRefreshScans) == 0;
         const ScanStats stats = globalRefresh
-            ? ScanAndFixPriority16(query, allocateHeap, freeHeap, heap, openThread, setThread, openProcess, setProcess, closeHandle, buffer, capacity, threadCache, processCache, scanId++)
+            ? ScanAndFixPriority16(query, allocateHeap, reallocateHeap, heap, openThread, setThread, openProcess, setProcess, closeHandle, buffer, capacity, threadCache, processCache, scanId++)
             : ScanCachedPriority16Processes(getNextThread, queryThread, setThread, openProcess, setProcess, closeHandle, threadCache, processCache, scanId++);
         if (intervalMs == 0 || stats.fixedPriority16 != 0 || stats.openFailures != 0 || stats.fixFailures != 0) {
             std::printf("priority16_seen=%u priority16_fixed=%u cached_skipped=%u open_failures=%u fix_failures=%u\n",
