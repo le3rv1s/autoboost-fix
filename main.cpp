@@ -76,15 +76,16 @@ constexpr uint8_t kCacheEmpty = 0;
 constexpr uint8_t kCacheFixed = 1;
 constexpr uint8_t kCacheDenied = 2;
 constexpr uint8_t kCacheFailed = 3;
-const ACCESS_MASK kThreadFixAccess = THREAD_SET_LIMITED_INFORMATION;
-const ACCESS_MASK kThreadSetAccess = THREAD_SET_INFORMATION;
-const ACCESS_MASK kThreadQuerySetAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
+const ACCESS_MASK kThreadFixAccess = THREAD_SET_INFORMATION;
+const ACCESS_MASK kThreadLimitedFixAccess = THREAD_SET_LIMITED_INFORMATION;
+const ACCESS_MASK kThreadQuerySetAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION;
+const ACCESS_MASK kThreadLimitedQuerySetAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
 const ACCESS_MASK kThreadFullQuerySetAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION;
-const ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
+const ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION;
 constexpr uint8_t kOpenFailureProtected = 1;
 constexpr uint8_t kOpenFailureTransient = 2;
 constexpr uint8_t kOpenFailureOther = 3;
-const ACCESS_MASK kProcessEnumAccess = PROCESS_QUERY_LIMITED_INFORMATION;
+const ACCESS_MASK kProcessEnumAccess = PROCESS_QUERY_INFORMATION;
 const ACCESS_MASK kProcessBoostAccess = PROCESS_SET_INFORMATION;
 
 struct NativeClientId {
@@ -423,10 +424,11 @@ static bool OpenPriorityFixThread(NtOpenThreadFn openThread,
                                   uint8_t& failureKind) noexcept {
     const ACCESS_MASK accessMasks[] = {
         kThreadFixAccess,
-        kThreadSetAccess,
         kThreadQuerySetAccess,
         kThreadFullQuerySetAccess,
-        THREAD_ALL_ACCESS
+        THREAD_ALL_ACCESS,
+        kThreadLimitedFixAccess,
+        kThreadLimitedQuerySetAccess
     };
 
     NTSTATUS_T lastStatus = kStatusAccessDenied;
