@@ -215,6 +215,40 @@ struct ProcessCache {
     ProcessCacheEntry entries[kProcessCacheSize]{};
 };
 
+static bool EqualsInsensitiveAscii(const WCHAR* text, size_t length, const char* ascii) noexcept {
+    for (size_t i = 0; i < length; ++i) {
+        char c = ascii[i];
+        if (c == '\0') {
+            return false;
+        }
+
+        WCHAR w = text[i];
+        if (w >= L'A' && w <= L'Z') {
+            w = static_cast<WCHAR>(w + (L'a' - L'A'));
+        }
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c + ('a' - 'A'));
+        }
+
+        if (w != static_cast<WCHAR>(c)) {
+            return false;
+        }
+    }
+
+    return ascii[length] == '\0';
+}
+
+static bool IsExcludedProcess(const NativeUnicodeString& imageName) noexcept {
+    if (imageName.Buffer == nullptr || imageName.Length == 0) {
+        return false;
+    }
+
+    const size_t chars = imageName.Length / sizeof(WCHAR);
+    return EqualsInsensitiveAscii(imageName.Buffer, chars, "csrss.exe") ||
+        EqualsInsensitiveAscii(imageName.Buffer, chars, "system.exe") ||
+        EqualsInsensitiveAscii(imageName.Buffer, chars, "system");
+}
+
 static HANDLE NtCurrentProcessHandle() noexcept {
     return reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-1));
 }
@@ -527,10 +561,12 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
     auto* process = reinterpret_cast<NativeSystemProcessInformation*>(buffer);
 
     for (;;) {
+        const bool skipProcess = IsExcludedProcess(process->ImageName);
         const ULONG threadCount = process->NumberOfThreads;
         const NativeSystemThreadInformation* thread = process->Threads;
 
-        for (ULONG i = 0; i < threadCount; ++i, ++thread) {
+        if (!skipProcess) {
+            for (ULONG i = 0; i < threadCount; ++i, ++thread) {
             if (thread->Priority != kTargetPriority && thread->BasePriority != kTargetPriority) {
                 continue;
             }
@@ -568,6 +604,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
             } else {
                 ++stats.fixFailures;
                 RememberThread(threadCache, processId, threadId, scanId, kCacheFailed);
+            }
             }
         }
 
