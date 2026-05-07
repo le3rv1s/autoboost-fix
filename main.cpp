@@ -6,10 +6,16 @@
 #include <cstdlib>
 #include <memory>
 
-using NTSTATUS = LONG;
+using NTSTATUS_T = LONG;
 using KPRIORITY = LONG;
 
-constexpr NTSTATUS STATUS_INFO_LENGTH_MISMATCH = static_cast<NTSTATUS>(0xC0000004L);
+struct UNICODE_STRING_T {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+};
+
+constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH = static_cast<NTSTATUS_T>(0xC0000004L);
 constexpr ULONG SystemProcessInformation = 5;
 constexpr KPRIORITY kTargetPriority = 16;
 
@@ -36,7 +42,7 @@ struct SYSTEM_PROCESS_INFORMATION_T {
     ULONG NextEntryOffset;
     ULONG NumberOfThreads;
     BYTE Reserved1[48];
-    UNICODE_STRING ImageName;
+    UNICODE_STRING_T ImageName;
     KPRIORITY BasePriority;
     HANDLE UniqueProcessId;
     PVOID Reserved2;
@@ -54,7 +60,7 @@ struct SYSTEM_PROCESS_INFORMATION_T {
     SYSTEM_THREAD_INFORMATION_T Threads[1];
 };
 
-using NtQuerySystemInformationFn = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+using NtQuerySystemInformationFn = NTSTATUS_T(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
 
 struct ScanStats {
     uint32_t seenPriority16 = 0;
@@ -81,7 +87,7 @@ static bool QueryProcessSnapshot(NtQuerySystemInformationFn query,
                                  std::unique_ptr<BYTE[]>& buffer,
                                  ULONG& capacity) noexcept {
     ULONG required = 0;
-    NTSTATUS status = query(SystemProcessInformation, buffer.get(), capacity, &required);
+    NTSTATUS_T status = query(SystemProcessInformation, buffer.get(), capacity, &required);
     if (status == STATUS_INFO_LENGTH_MISMATCH) {
         const ULONG nextCapacity = required > capacity ? required + (64U * 1024U) : capacity * 2U;
         auto nextBuffer = std::make_unique<BYTE[]>(nextCapacity);
