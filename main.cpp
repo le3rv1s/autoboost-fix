@@ -59,8 +59,8 @@ constexpr ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_LIMITED_INFORMATION |
 constexpr uint8_t kOpenFailureProtected = 1;
 constexpr uint8_t kOpenFailureTransient = 2;
 constexpr uint8_t kOpenFailureOther = 3;
-constexpr DWORD kProcessEnumAccess = PROCESS_QUERY_LIMITED_INFORMATION;
-constexpr DWORD kProcessBoostAccess = PROCESS_SET_INFORMATION;
+constexpr ACCESS_MASK kProcessEnumAccess = PROCESS_QUERY_LIMITED_INFORMATION;
+constexpr ACCESS_MASK kProcessBoostAccess = PROCESS_SET_INFORMATION;
 
 struct CLIENT_ID_T {
     HANDLE UniqueProcess;
@@ -362,7 +362,7 @@ static bool OpenPriorityFixThread(NtOpenThreadFn openThread,
                                   DWORD threadId,
                                   HANDLE& thread,
                                   uint8_t& failureKind) noexcept {
-    constexpr ACCESS_MASK accessMasks[] = {
+    const ACCESS_MASK accessMasks[] = {
         kThreadFixAccess,
         kThreadSetAccess,
         kThreadQuerySetAccess,
