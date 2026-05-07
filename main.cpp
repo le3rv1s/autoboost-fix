@@ -554,11 +554,13 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
                 ++stats.fixedPriority16;
                 RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
             } else if (error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_PARAMETER) {
-                ++stats.openFailures;
                 if (openFailureKind == kOpenFailureTransient) {
+                    ++stats.openFailures;
                     ++stats.transientFailures;
                 } else if (openFailureKind == kOpenFailureProtected) {
                     ++stats.protectedFailures;
+                } else {
+                    ++stats.openFailures;
                 }
 
                 RememberThread(threadCache, processId, threadId, scanId,
