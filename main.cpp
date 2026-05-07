@@ -238,7 +238,15 @@ static bool EqualsInsensitiveAscii(const WCHAR* text, size_t length, const char*
     return ascii[length] == '\0';
 }
 
-static bool IsExcludedProcess(const NativeUnicodeString& imageName) noexcept {
+static bool IsExcludedProcessId(DWORD processId) noexcept {
+    return processId == 0 || processId == 4;
+}
+
+static bool IsExcludedProcess(DWORD processId, const NativeUnicodeString& imageName) noexcept {
+    if (IsExcludedProcessId(processId)) {
+        return true;
+    }
+
     if (imageName.Buffer == nullptr || imageName.Length == 0) {
         return false;
     }
@@ -501,7 +509,7 @@ static void RememberProcess(ProcessCache& cache,
                             NtCloseFn closeHandle,
                             DWORD processId,
                             uint32_t scanId) noexcept {
-    if (processId == 0) {
+    if (IsExcludedProcessId(processId)) {
         return;
     }
 
@@ -561,50 +569,52 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
     auto* process = reinterpret_cast<NativeSystemProcessInformation*>(buffer);
 
     for (;;) {
-        const bool skipProcess = IsExcludedProcess(process->ImageName);
+        const DWORD snapshotProcessId = static_cast<DWORD>(
+            reinterpret_cast<ULONG_PTR>(process->UniqueProcessId));
+        const bool skipProcess = IsExcludedProcess(snapshotProcessId, process->ImageName);
         const ULONG threadCount = process->NumberOfThreads;
         const NativeSystemThreadInformation* thread = process->Threads;
 
         if (!skipProcess) {
             for (ULONG i = 0; i < threadCount; ++i, ++thread) {
-            if (thread->Priority != kTargetPriority && thread->BasePriority != kTargetPriority) {
-                continue;
-            }
-
-            const DWORD processId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(thread->ClientId.UniqueProcess));
-            const DWORD threadId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(thread->ClientId.UniqueThread));
-            if (threadId == 0 || threadId == currentThreadId) {
-                continue;
-            }
-
-            ++stats.seenPriority16;
-            RememberProcess(processCache, openProcess, setProcess, closeHandle, processId, scanId);
-            if (ShouldSkipCachedThread(threadCache, processId, threadId, scanId)) {
-                ++stats.cachedSkipped;
-                continue;
-            }
-
-            DWORD error = ERROR_SUCCESS;
-            uint8_t openFailureKind = kOpenFailureOther;
-            if (FixPriority16Thread(openThread, setThread, closeHandle, processId, threadId, error, openFailureKind)) {
-                ++stats.fixedPriority16;
-                RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
-            } else if (error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_PARAMETER) {
-                if (openFailureKind == kOpenFailureTransient) {
-                    ++stats.openFailures;
-                    ++stats.transientFailures;
-                } else if (openFailureKind == kOpenFailureProtected) {
-                    ++stats.protectedFailures;
-                } else {
-                    ++stats.openFailures;
+                if (thread->Priority != kTargetPriority && thread->BasePriority != kTargetPriority) {
+                    continue;
                 }
 
-                RememberThread(threadCache, processId, threadId, scanId,
-                               openFailureKind == kOpenFailureTransient ? kCacheEmpty : kCacheDenied);
-            } else {
-                ++stats.fixFailures;
-                RememberThread(threadCache, processId, threadId, scanId, kCacheFailed);
-            }
+                const DWORD processId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(thread->ClientId.UniqueProcess));
+                const DWORD threadId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(thread->ClientId.UniqueThread));
+                if (threadId == 0 || threadId == currentThreadId || IsExcludedProcessId(processId)) {
+                    continue;
+                }
+
+                ++stats.seenPriority16;
+                RememberProcess(processCache, openProcess, setProcess, closeHandle, processId, scanId);
+                if (ShouldSkipCachedThread(threadCache, processId, threadId, scanId)) {
+                    ++stats.cachedSkipped;
+                    continue;
+                }
+
+                DWORD error = ERROR_SUCCESS;
+                uint8_t openFailureKind = kOpenFailureOther;
+                if (FixPriority16Thread(openThread, setThread, closeHandle, processId, threadId, error, openFailureKind)) {
+                    ++stats.fixedPriority16;
+                    RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
+                } else if (error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_PARAMETER) {
+                    if (openFailureKind == kOpenFailureTransient) {
+                        ++stats.openFailures;
+                        ++stats.transientFailures;
+                    } else if (openFailureKind == kOpenFailureProtected) {
+                        ++stats.protectedFailures;
+                    } else {
+                        ++stats.openFailures;
+                    }
+
+                    RememberThread(threadCache, processId, threadId, scanId,
+                                   openFailureKind == kOpenFailureTransient ? kCacheEmpty : kCacheDenied);
+                } else {
+                    ++stats.fixFailures;
+                    RememberThread(threadCache, processId, threadId, scanId, kCacheFailed);
+                }
             }
         }
 
@@ -617,6 +627,15 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
     }
 
     return stats;
+}
+
+static void CloseProcessCache(ProcessCache& processCache, NtCloseFn closeHandle) noexcept {
+    for (ProcessCacheEntry& entry : processCache.entries) {
+        if (entry.process != nullptr) {
+            closeHandle(entry.process);
+            entry.process = nullptr;
+        }
+    }
 }
 
 static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
@@ -670,7 +689,7 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
 
             const DWORD processId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueProcess));
             const DWORD threadId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueThread));
-            if (threadId == 0 || threadId == currentThreadId) {
+            if (threadId == 0 || threadId == currentThreadId || IsExcludedProcessId(processId)) {
                 continue;
             }
 
@@ -801,6 +820,7 @@ int wmain(int argc, wchar_t** argv) {
         delayExecution(FALSE, &delay);
     } while (true);
 
+    CloseProcessCache(processCache, closeHandle);
     freeHeap(heap, 0, buffer);
     destroyHeap(heap);
     return 0;
