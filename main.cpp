@@ -143,7 +143,24 @@ struct NativeSystemProcessInformation {
     SIZE_T QuotaPagedPoolUsage;
     SIZE_T QuotaPeakNonPagedPoolUsage;
     SIZE_T QuotaNonPagedPoolUsage;
-using NtGetNextProcessPtr = NTSTATUS_T(NTAPI*)(HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
+typedef NTSTATUS_T(NTAPI* NtGetNextProcessFn)(HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
+static void RememberProcess(ProcessCache& cache,
+    NtOpenProcessFn openProcess,
+    NtCloseFn closeHandle,
+    DWORD processId,
+    uint32_t scanId) noexcept;
+
+static ScanStats DiscoverPriority16Processes(NtGetNextProcessFn nextProcess,
+    NtGetNextThreadFn getNextThread,
+    NtQueryInformationThreadFn queryThread,
+    NtSetInformationThreadFn setThread,
+    NtOpenProcessFn openProcess,
+    NtCloseFn closeHandle,
+    ThreadCache& threadCache,
+    ProcessCache& processCache,
+    HANDLE& discoveryProcessCursor,
+    uint32_t scanId) noexcept;
+
     SIZE_T PagefileUsage;
     SIZE_T PeakPagefileUsage;
     SIZE_T PrivatePageCount;
@@ -658,7 +675,7 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
         ProcessCacheEntry& processEntry = processCache.entries[(processCursor + visited) % kProcessCacheSize];
         ++visited;
         if (processEntry.processId == 0) {
-static ScanStats DiscoverPriority16Processes(NtGetNextProcessPtr getNextProcess,
+static ScanStats DiscoverPriority16Processes(NtGetNextProcessFn nextProcess,
     NtGetNextThreadFn getNextThread,
     NtQueryInformationThreadFn queryThread,
     NtSetInformationThreadFn setThread,
@@ -674,7 +691,7 @@ static ScanStats DiscoverPriority16Processes(NtGetNextProcessPtr getNextProcess,
     size_t scannedProcesses = 0;
     while (scannedProcesses < kDiscoveryProcessesPerRefresh) {
         HANDLE process = nullptr;
-        NTSTATUS_T status = getNextProcess(discoveryProcessCursor,
+        NTSTATUS_T status = nextProcess(discoveryProcessCursor,
             kProcessEnumAccess,
             0,
             0,
@@ -685,7 +702,7 @@ static ScanStats DiscoverPriority16Processes(NtGetNextProcessPtr getNextProcess,
         }
 
         if (status < 0 || process == nullptr) {
-            status = getNextProcess(nullptr,
+            status = nextProcess(nullptr,
                 kProcessEnumAccess,
                 0,
                 0,
@@ -915,10 +932,10 @@ int wmain(int argc, wchar_t** argv) {
         capacity = 64U * 1024U;
         buffer = allocateHeap(heap, 0, capacity);
     }
-    const auto getNextProcess = reinterpret_cast<NtGetNextProcessPtr>(
+    const auto nextProcess = reinterpret_cast<NtGetNextProcessFn>(
         GetProcAddress(ntdll, "NtGetNextProcess"));
     if (openThread == nullptr || query == nullptr || queryThread == nullptr ||
-        setThread == nullptr || getNextThread == nullptr || getNextProcess == nullptr) {
+        setThread == nullptr || getNextThread == nullptr || nextProcess == nullptr) {
         std::fputs("failed to allocate snapshot buffer\n", stderr);
         destroyHeap(heap);
         return 1;
@@ -971,7 +988,7 @@ int wmain(int argc, wchar_t** argv) {
                     ? ScanCachedPriority16Processes(getNextThread,
                         queryThread,
                         setThread,
-                        openProcess,
+                ? DiscoverPriority16Processes(nextProcess,
                         closeHandle,
                         threadCache,
                         processCache,
