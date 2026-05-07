@@ -70,6 +70,7 @@ constexpr uint32_t kRetryCooldownScans = 8192;
 constexpr uint32_t kRetryCooldownFixedScans = 2;
 constexpr uint32_t kCachedRefreshStride = 1;
 constexpr uint32_t kCachedProcessRescanScans = 2;
+constexpr uint32_t kProcessOpenFailureCooldownScans = 30;
 constexpr size_t kThreadCacheSize = 512;
 constexpr size_t kProcessCacheSize = 64;
 constexpr size_t kCachedProcessesPerScan = 1;
@@ -208,11 +209,15 @@ struct ProcessCacheEntry {
     HANDLE process = nullptr;
     uint32_t lastSeenScan = 0;
     uint32_t lastScannedScan = 0;
+    uint32_t lastOpenFailureScan = 0;
 };
 
 struct ProcessCache {
     ProcessCacheEntry entries[kProcessCacheSize]{};
 };
+
+static_assert((kThreadCacheSize & (kThreadCacheSize - 1)) == 0, "thread cache size must be power of two");
+static_assert((kProcessCacheSize & (kProcessCacheSize - 1)) == 0, "process cache size must be power of two");
 
 static bool EqualsInsensitiveAscii(const WCHAR* text, size_t length, const char* ascii) noexcept {
     for (size_t i = 0; i < length; ++i) {
@@ -295,6 +300,14 @@ static void EnableAllTokenPrivileges(RtlAllocateHeapFn allocateHeap,
 
 static uint32_t HashThreadKey(DWORD processId, DWORD threadId) noexcept {
     uint32_t x = processId * 16777619u ^ threadId;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    return x;
+}
+
+static uint32_t HashProcessKey(DWORD processId) noexcept {
+    uint32_t x = processId;
     x ^= x >> 16;
     x *= 0x7feb352du;
     x ^= x >> 15;
@@ -465,59 +478,8 @@ static HANDLE OpenCachedProcess(NtOpenProcessFn openProcess, DWORD processId) no
     return OpenProcessNative(openProcess, processId, kProcessEnumAccess);
 }
 
-static bool OpenPriorityFixThreadFromProcess(NtGetNextThreadFn getNextThread,
-    NtQueryInformationThreadFn queryThread,
-    NtOpenProcessFn openProcess,
-    NtCloseFn closeHandle,
-    DWORD processId,
-    DWORD threadId,
-    HANDLE& thread) noexcept {
-    thread = nullptr;
-
-    HANDLE process = OpenCachedProcess(openProcess, processId);
-    if (process == nullptr) {
-        return false;
-    }
-
-    HANDLE previousThread = nullptr;
-    for (;;) {
-        HANDLE candidate = nullptr;
-        const NTSTATUS_T status = getNextThread(process,
-            previousThread,
-            kThreadQueryFixAccess,
-            0,
-            0,
-            &candidate);
-        if (previousThread != nullptr) {
-            closeHandle(previousThread);
-        }
-
-        if (status < 0 || candidate == nullptr) {
-            closeHandle(process);
-            return false;
-        }
-
-        previousThread = candidate;
-        NativeThreadBasicInformation basic{};
-        if (queryThread(candidate, kThreadBasicInformation, &basic, sizeof(basic), nullptr) < 0) {
-            continue;
-        }
-
-        const DWORD candidateThreadId = static_cast<DWORD>(
-            reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueThread));
-        if (candidateThreadId == threadId) {
-            thread = candidate;
-            closeHandle(process);
-            return true;
-        }
-    }
-}
-
 static bool FixPriority16Thread(NtOpenThreadFn openThread,
-    NtGetNextThreadFn getNextThread,
-    NtQueryInformationThreadFn queryThread,
     NtSetInformationThreadFn setThread,
-    NtOpenProcessFn openProcess,
     NtCloseFn closeHandle,
     DWORD processId,
     DWORD threadId,
@@ -537,7 +499,6 @@ static bool FixPriority16Thread(NtOpenThreadFn openThread,
 }
 
 static void RememberProcess(ProcessCache& cache,
-    NtOpenProcessFn openProcess,
     NtCloseFn closeHandle,
     DWORD processId,
     uint32_t scanId) noexcept {
@@ -545,36 +506,34 @@ static void RememberProcess(ProcessCache& cache,
         return;
     }
 
-    size_t slot = kProcessCacheSize;
+    const size_t start = HashProcessKey(processId) & (kProcessCacheSize - 1);
+    size_t slot = start;
     uint32_t oldestAge = 0;
-    for (size_t i = 0; i < kProcessCacheSize; ++i) {
-        ProcessCacheEntry& entry = cache.entries[i];
+    for (size_t probe = 0; probe < 4; ++probe) {
+        const size_t index = (start + probe) & (kProcessCacheSize - 1);
+        ProcessCacheEntry& entry = cache.entries[index];
         if (entry.processId == processId) {
             entry.lastSeenScan = scanId;
             return;
         }
 
         if (entry.processId == 0) {
-            slot = i;
+            slot = index;
             break;
         }
 
         const uint32_t age = scanId - entry.lastSeenScan;
         if (age >= oldestAge) {
             oldestAge = age;
-            slot = i;
+            slot = index;
         }
-    }
-
-    if (slot == kProcessCacheSize) {
-        return;
     }
 
     if (cache.entries[slot].process != nullptr) {
         closeHandle(cache.entries[slot].process);
     }
 
-    cache.entries[slot] = ProcessCacheEntry{ processId, OpenCachedProcess(openProcess, processId), scanId, 0 };
+    cache.entries[slot] = ProcessCacheEntry{ processId, nullptr, scanId, 0, 0 };
 }
 
 static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
@@ -582,10 +541,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
     RtlReAllocateHeapFn reallocateHeap,
     PVOID heap,
     NtOpenThreadFn openThread,
-    NtGetNextThreadFn getNextThread,
-    NtQueryInformationThreadFn queryThread,
     NtSetInformationThreadFn setThread,
-    NtOpenProcessFn openProcess,
     NtCloseFn closeHandle,
     PVOID& buffer,
     ULONG& capacity,
@@ -603,6 +559,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
         const bool skipProcess = IsExcludedProcess(process->ImageName);
         const ULONG threadCount = process->NumberOfThreads;
         const NativeSystemThreadInformation* thread = process->Threads;
+        bool processRemembered = false;
 
         if (!skipProcess) {
             for (ULONG i = 0; i < threadCount; ++i, ++thread) {
@@ -617,7 +574,10 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
                 }
 
                 ++stats.seenPriority16;
-                RememberProcess(processCache, openProcess, closeHandle, processId, scanId);
+                if (!processRemembered) {
+                    RememberProcess(processCache, closeHandle, processId, scanId);
+                    processRemembered = true;
+                }
                 if (ShouldSkipCachedThread(threadCache, processId, threadId, scanId)) {
                     ++stats.cachedSkipped;
                     continue;
@@ -626,10 +586,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
                 DWORD error = ERROR_SUCCESS;
                 uint8_t openFailureKind = kOpenFailureOther;
                 if (FixPriority16Thread(openThread,
-                    getNextThread,
-                    queryThread,
                     setThread,
-                    openProcess,
                     closeHandle,
                     processId,
                     threadId,
@@ -707,10 +664,17 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
         processEntry.lastScannedScan = scanId;
 
         if (processEntry.process == nullptr) {
-            processEntry.process = OpenCachedProcess(openProcess, processEntry.processId);
-            if (processEntry.process == nullptr) {
+            if (processEntry.lastOpenFailureScan != 0 &&
+                scanId - processEntry.lastOpenFailureScan < kProcessOpenFailureCooldownScans) {
                 continue;
             }
+
+            processEntry.process = OpenCachedProcess(openProcess, processEntry.processId);
+            if (processEntry.process == nullptr) {
+                processEntry.lastOpenFailureScan = scanId;
+                continue;
+            }
+            processEntry.lastOpenFailureScan = 0;
         }
 
         HANDLE previousThread = nullptr;
@@ -773,7 +737,7 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
             }
         }
     }
-    processCursor = (processCursor + handled) % kProcessCacheSize;
+    processCursor = (processCursor + visited) % kProcessCacheSize;
 
     return stats;
 }
@@ -861,10 +825,7 @@ int wmain(int argc, wchar_t** argv) {
                 reallocateHeap,
                 heap,
                 openThread,
-                getNextThread,
-                queryThread,
                 setThread,
-                openProcess,
                 closeHandle,
                 buffer,
                 capacity,
