@@ -76,12 +76,15 @@ constexpr uint8_t kCacheEmpty = 0;
 constexpr uint8_t kCacheFixed = 1;
 constexpr uint8_t kCacheDenied = 2;
 constexpr uint8_t kCacheFailed = 3;
-const ACCESS_MASK kThreadFixAccess = THREAD_SET_INFORMATION;
+const ACCESS_MASK kThreadFixAccess = THREAD_SET_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
 const ACCESS_MASK kThreadLimitedFixAccess = THREAD_SET_LIMITED_INFORMATION;
-const ACCESS_MASK kThreadQuerySetAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION;
+const ACCESS_MASK kThreadQuerySetAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION |
+    THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
 const ACCESS_MASK kThreadLimitedQuerySetAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
-const ACCESS_MASK kThreadFullQuerySetAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION;
-const ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION;
+const ACCESS_MASK kThreadFullQuerySetAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION |
+    THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
+const ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION |
+    THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
 constexpr uint8_t kOpenFailureProtected = 1;
 constexpr uint8_t kOpenFailureTransient = 2;
 constexpr uint8_t kOpenFailureOther = 3;
@@ -182,8 +185,13 @@ struct NativeThreadBasicInformation {
 };
 
 constexpr ULONG kThreadBasicInformation = 0;
+constexpr ULONG kThreadPriority = 2;
+constexpr ULONG kThreadBasePriority = 3;
 constexpr ULONG kThreadPriorityBoost = 14;
+constexpr ULONG kThreadActualBasePriority = 25;
 constexpr ULONG kProcessPriorityBoost = 22;
+constexpr KPRIORITY kNormalPriority = 8;
+constexpr KPRIORITY kHighPriority = 15;
 
 struct ScanStats {
     uint32_t seenPriority16 = 0;
@@ -379,17 +387,64 @@ static bool QueryProcessSnapshot(NtQuerySystemInformationFn query,
     return status >= 0;
 }
 
+static bool SetThreadPriorityValue(NtSetInformationThreadFn setThread,
+                                   HANDLE thread,
+                                   ULONG informationClass,
+                                   KPRIORITY priority,
+                                   NTSTATUS_T& lastStatus) noexcept {
+    KPRIORITY value = priority;
+    lastStatus = setThread(thread, informationClass, &value, sizeof(value));
+    return lastStatus >= 0;
+}
+
+static bool LowerPriority16ThreadHandle(NtSetInformationThreadFn setThread,
+                                        HANDLE thread,
+                                        NTSTATUS_T& lastStatus) noexcept {
+    const ULONG informationClasses[] = {
+        kThreadActualBasePriority,
+        kThreadBasePriority,
+        kThreadPriority
+    };
+    const KPRIORITY targetPriorities[] = {
+        kHighPriority,
+        kNormalPriority
+    };
+
+    for (size_t priorityIndex = 0;
+         priorityIndex < sizeof(targetPriorities) / sizeof(targetPriorities[0]);
+         ++priorityIndex) {
+        for (size_t classIndex = 0;
+             classIndex < sizeof(informationClasses) / sizeof(informationClasses[0]);
+             ++classIndex) {
+            if (SetThreadPriorityValue(setThread,
+                                       thread,
+                                       informationClasses[classIndex],
+                                       targetPriorities[priorityIndex],
+                                       lastStatus)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 static bool FixPriority16ThreadHandle(NtSetInformationThreadFn setThread, HANDLE thread, DWORD& error) noexcept {
     error = ERROR_SUCCESS;
 
+    NTSTATUS_T priorityStatus = kStatusInvalidParameter;
+    const bool loweredPriority = LowerPriority16ThreadHandle(setThread, thread, priorityStatus);
+
     ULONG disableBoost = TRUE;
-    const NTSTATUS_T status = setThread(thread, kThreadPriorityBoost, &disableBoost, sizeof(disableBoost));
-    if (status < 0) {
-        error = ERROR_ACCESS_DENIED;
-        return false;
+    const NTSTATUS_T boostStatus = setThread(thread, kThreadPriorityBoost, &disableBoost, sizeof(disableBoost));
+    if (loweredPriority) {
+        return true;
     }
 
-    return true;
+    error = boostStatus < 0 && priorityStatus == kStatusInvalidParameter
+        ? ERROR_INVALID_PARAMETER
+        : ERROR_ACCESS_DENIED;
+    return false;
 }
 
 static NTSTATUS_T TryOpenPriorityThread(NtOpenThreadFn openThread,
