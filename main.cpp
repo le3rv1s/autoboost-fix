@@ -70,6 +70,8 @@ constexpr uint32_t kRetryCooldownScans = 8192;
 constexpr uint32_t kRetryCooldownFixedScans = 2;
 constexpr uint32_t kCachedRefreshStride = 1;
 constexpr uint32_t kCachedProcessRescanScans = 2;
+constexpr size_t kDiscoveryProcessesPerRefresh = 2;
+constexpr size_t kDiscoveryThreadsPerProcess = 32;
 constexpr uint32_t kProcessOpenFailureCooldownScans = 30;
 constexpr size_t kThreadCacheSize = 512;
 constexpr size_t kProcessCacheSize = 64;
@@ -141,6 +143,7 @@ struct NativeSystemProcessInformation {
     SIZE_T QuotaPagedPoolUsage;
     SIZE_T QuotaPeakNonPagedPoolUsage;
     SIZE_T QuotaNonPagedPoolUsage;
+using NtGetNextProcessFn = NTSTATUS_T(NTAPI*)(HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
     SIZE_T PagefileUsage;
     SIZE_T PeakPagefileUsage;
     SIZE_T PrivatePageCount;
@@ -655,6 +658,121 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
         ProcessCacheEntry& processEntry = processCache.entries[(processCursor + visited) % kProcessCacheSize];
         ++visited;
         if (processEntry.processId == 0) {
+static HANDLE NextDiscoveryProcess(NtGetNextProcessFn getNextProcess,
+    NtCloseFn closeHandle,
+    HANDLE& processCursor) noexcept {
+    HANDLE nextProcess = nullptr;
+    const NTSTATUS_T status = getNextProcess(processCursor,
+        kProcessEnumAccess,
+        0,
+        0,
+        &nextProcess);
+    if (processCursor != nullptr) {
+        closeHandle(processCursor);
+        processCursor = nullptr;
+    }
+
+    if (status < 0 || nextProcess == nullptr) {
+        return nullptr;
+    }
+
+    processCursor = nextProcess;
+    return nextProcess;
+}
+
+static ScanStats DiscoverPriority16Processes(NtGetNextProcessFn getNextProcess,
+    NtGetNextThreadFn getNextThread,
+    NtQueryInformationThreadFn queryThread,
+    NtSetInformationThreadFn setThread,
+    NtOpenProcessFn openProcess,
+    NtCloseFn closeHandle,
+    ThreadCache& threadCache,
+    ProcessCache& processCache,
+    HANDLE& discoveryProcessCursor,
+    uint32_t scanId) noexcept {
+    ScanStats stats{};
+    const DWORD currentThreadId = GetCurrentThreadId();
+
+    size_t scannedProcesses = 0;
+    while (scannedProcesses < kDiscoveryProcessesPerRefresh) {
+        HANDLE process = NextDiscoveryProcess(getNextProcess, closeHandle, discoveryProcessCursor);
+        if (process == nullptr) {
+            process = NextDiscoveryProcess(getNextProcess, closeHandle, discoveryProcessCursor);
+            if (process == nullptr) {
+                break;
+            }
+        }
+        ++scannedProcesses;
+
+        const DWORD processIdForCache = GetProcessId(process);
+        HANDLE previousThread = nullptr;
+        size_t scannedThreads = 0;
+        for (;;) {
+            HANDLE thread = nullptr;
+            const NTSTATUS_T status = getNextThread(process,
+                previousThread,
+                kThreadQueryFixAccess,
+                0,
+                0,
+                &thread);
+            if (previousThread != nullptr) {
+                closeHandle(previousThread);
+            }
+
+            if (status < 0 || thread == nullptr) {
+                break;
+            }
+
+            previousThread = thread;
+            if (++scannedThreads > kDiscoveryThreadsPerProcess) {
+                break;
+            }
+
+            NativeThreadBasicInformation basic{};
+            if (queryThread(thread, kThreadBasicInformation, &basic, sizeof(basic), nullptr) < 0) {
+                continue;
+            }
+
+            if (basic.Priority != kTargetPriority && basic.BasePriority != kTargetPriority) {
+                continue;
+            }
+
+            const DWORD processId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueProcess));
+            const DWORD threadId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueThread));
+            if (threadId == 0 || threadId == currentThreadId) {
+                continue;
+            }
+
+            ++stats.seenPriority16;
+            RememberProcess(processCache,
+                openProcess,
+                closeHandle,
+                processIdForCache != 0 ? processIdForCache : processId,
+                scanId);
+            if (ShouldSkipCachedThread(threadCache, processId, threadId, scanId)) {
+                ++stats.cachedSkipped;
+                continue;
+            }
+
+            DWORD error = ERROR_SUCCESS;
+            if (FixPriority16ThreadHandle(setThread, thread, error)) {
+                ++stats.fixedPriority16;
+                RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
+            }
+            else if (error == ERROR_ACCESS_DENIED) {
+                ++stats.openFailures;
+                RememberThread(threadCache, processId, threadId, scanId, kCacheDenied);
+            }
+            else {
+                ++stats.fixFailures;
+                RememberThread(threadCache, processId, threadId, scanId, kCacheFailed);
+            }
+        }
+    }
+
+    return stats;
+}
+
             continue;
         }
         ++handled;
@@ -800,7 +918,10 @@ int wmain(int argc, wchar_t** argv) {
         capacity = 64U * 1024U;
         buffer = allocateHeap(heap, 0, capacity);
     }
-    if (buffer == nullptr) {
+    const auto getNextProcess = reinterpret_cast<NtGetNextProcessFn>(
+        GetProcAddress(ntdll, "NtGetNextProcess"));
+    if (openThread == nullptr || query == nullptr || queryThread == nullptr ||
+        setThread == nullptr || getNextThread == nullptr || getNextProcess == nullptr) {
         std::fputs("failed to allocate snapshot buffer\n", stderr);
         destroyHeap(heap);
         return 1;
@@ -808,18 +929,24 @@ int wmain(int argc, wchar_t** argv) {
     ThreadCache threadCache{};
     ProcessCache processCache{};
     size_t processCursor = 0;
+    HANDLE discoveryProcessCursor = nullptr;
     uint32_t scanId = 1;
     const uint32_t intervalMs = ReadIntervalMs(argc, argv);
 
     if (intervalMs != 0) {
-        std::printf("monitoring priority 16 threads every %u ms; global refresh every %u scans; cached budget=%zu process/scan; pass 0 for one scan\n",
-            intervalMs, kGlobalRefreshScans, kCachedProcessesPerScan);
+        std::printf("monitoring priority 16 threads every %u ms; bounded global refresh every %u scans (%zu processes, %zu threads/process); cached budget=%zu process/scan; pass 0 for one full snapshot\n",
+            intervalMs,
+            kGlobalRefreshScans,
+            kDiscoveryProcessesPerRefresh,
+            kDiscoveryThreadsPerProcess,
+            kCachedProcessesPerScan);
     }
 
     do {
-        const bool globalRefresh = intervalMs == 0 || scanId == 1 || (scanId % kGlobalRefreshScans) == 0;
+        const bool oneShot = intervalMs == 0;
+        const bool globalRefresh = oneShot || scanId == 1 || (scanId % kGlobalRefreshScans) == 0;
         const bool cachedRefresh = !globalRefresh && (scanId % kCachedRefreshStride) == 0;
-        const ScanStats stats = globalRefresh
+        const ScanStats stats = oneShot
             ? ScanAndFixPriority16(query,
                 allocateHeap,
                 reallocateHeap,
@@ -832,17 +959,28 @@ int wmain(int argc, wchar_t** argv) {
                 threadCache,
                 processCache,
                 scanId++)
-            : (cachedRefresh
-                ? ScanCachedPriority16Processes(getNextThread,
+            : (globalRefresh
+                ? DiscoverPriority16Processes(getNextProcess,
+                    getNextThread,
                     queryThread,
                     setThread,
                     openProcess,
                     closeHandle,
                     threadCache,
                     processCache,
-                    processCursor,
+                    discoveryProcessCursor,
                     scanId++)
-                : ScanStats{});
+                : (cachedRefresh
+                    ? ScanCachedPriority16Processes(getNextThread,
+                        queryThread,
+                        setThread,
+                        openProcess,
+                        closeHandle,
+                        threadCache,
+                        processCache,
+                        processCursor,
+                        scanId++)
+                    : ScanStats{}));
         if (intervalMs == 0 || stats.fixedPriority16 != 0 || stats.openFailures != 0 || stats.fixFailures != 0) {
             std::printf("priority16_seen=%u priority16_fixed=%u cached_skipped=%u open_failures=%u protected_failures=%u transient_failures=%u fix_failures=%u\n",
                 stats.seenPriority16,
@@ -863,6 +1001,9 @@ int wmain(int argc, wchar_t** argv) {
         delayExecution(FALSE, &delay);
     } while (true);
 
+    if (discoveryProcessCursor != nullptr) {
+        closeHandle(discoveryProcessCursor);
+    }
     CloseProcessCache(processCache, closeHandle);
     freeHeap(heap, 0, buffer);
     destroyHeap(heap);
