@@ -238,15 +238,7 @@ static bool EqualsInsensitiveAscii(const WCHAR* text, size_t length, const char*
     return ascii[length] == '\0';
 }
 
-static bool IsExcludedProcessId(DWORD processId) noexcept {
-    return processId == 0 || processId == 4;
-}
-
-static bool IsExcludedProcess(DWORD processId, const NativeUnicodeString& imageName) noexcept {
-    if (IsExcludedProcessId(processId)) {
-        return true;
-    }
-
+static bool IsExcludedProcess(const NativeUnicodeString& imageName) noexcept {
     if (imageName.Buffer == nullptr || imageName.Length == 0) {
         return false;
     }
@@ -455,25 +447,6 @@ static bool OpenPriorityFixThread(NtOpenThreadFn openThread,
     return false;
 }
 
-static bool FixPriority16Thread(NtOpenThreadFn openThread,
-                                NtSetInformationThreadFn setThread,
-                                NtCloseFn closeHandle,
-                                DWORD processId,
-                                DWORD threadId,
-                                DWORD& error,
-                                uint8_t& openFailureKind) noexcept {
-    error = ERROR_SUCCESS;
-    HANDLE thread = nullptr;
-    if (!OpenPriorityFixThread(openThread, processId, threadId, thread, openFailureKind)) {
-        error = ERROR_ACCESS_DENIED;
-        return false;
-    }
-
-    const bool ok = FixPriority16ThreadHandle(setThread, thread, error);
-    closeHandle(thread);
-    return ok;
-}
-
 static HANDLE OpenProcessNative(NtOpenProcessFn openProcess, DWORD processId, ACCESS_MASK desiredAccess) noexcept {
     HANDLE process = nullptr;
     NativeObjectAttributes attributes{sizeof(attributes), nullptr, nullptr, 0, nullptr, nullptr};
@@ -487,6 +460,83 @@ static HANDLE OpenProcessNative(NtOpenProcessFn openProcess, DWORD processId, AC
 
 static HANDLE OpenCachedProcess(NtOpenProcessFn openProcess, DWORD processId) noexcept {
     return OpenProcessNative(openProcess, processId, kProcessEnumAccess);
+}
+
+static bool OpenPriorityFixThreadFromProcess(NtGetNextThreadFn getNextThread,
+                                             NtQueryInformationThreadFn queryThread,
+                                             NtOpenProcessFn openProcess,
+                                             NtCloseFn closeHandle,
+                                             DWORD processId,
+                                             DWORD threadId,
+                                             HANDLE& thread) noexcept {
+    thread = nullptr;
+
+    HANDLE process = OpenCachedProcess(openProcess, processId);
+    if (process == nullptr) {
+        return false;
+    }
+
+    HANDLE previousThread = nullptr;
+    for (;;) {
+        HANDLE candidate = nullptr;
+        const NTSTATUS_T status = getNextThread(process,
+                                                previousThread,
+                                                kThreadQueryFixAccess,
+                                                0,
+                                                0,
+                                                &candidate);
+        if (previousThread != nullptr) {
+            closeHandle(previousThread);
+        }
+
+        if (status < 0 || candidate == nullptr) {
+            closeHandle(process);
+            return false;
+        }
+
+        previousThread = candidate;
+        NativeThreadBasicInformation basic{};
+        if (queryThread(candidate, kThreadBasicInformation, &basic, sizeof(basic), nullptr) < 0) {
+            continue;
+        }
+
+        const DWORD candidateThreadId = static_cast<DWORD>(
+            reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueThread));
+        if (candidateThreadId == threadId) {
+            thread = candidate;
+            closeHandle(process);
+            return true;
+        }
+    }
+}
+
+static bool FixPriority16Thread(NtOpenThreadFn openThread,
+                                NtGetNextThreadFn getNextThread,
+                                NtQueryInformationThreadFn queryThread,
+                                NtSetInformationThreadFn setThread,
+                                NtOpenProcessFn openProcess,
+                                NtCloseFn closeHandle,
+                                DWORD processId,
+                                DWORD threadId,
+                                DWORD& error,
+                                uint8_t& openFailureKind) noexcept {
+    error = ERROR_SUCCESS;
+    HANDLE thread = nullptr;
+    if (!OpenPriorityFixThread(openThread, processId, threadId, thread, openFailureKind) &&
+        !OpenPriorityFixThreadFromProcess(getNextThread,
+                                          queryThread,
+                                          openProcess,
+                                          closeHandle,
+                                          processId,
+                                          threadId,
+                                          thread)) {
+        error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+
+    const bool ok = FixPriority16ThreadHandle(setThread, thread, error);
+    closeHandle(thread);
+    return ok;
 }
 
 static void DisableProcessPriorityBoost(NtOpenProcessFn openProcess,
@@ -509,7 +559,7 @@ static void RememberProcess(ProcessCache& cache,
                             NtCloseFn closeHandle,
                             DWORD processId,
                             uint32_t scanId) noexcept {
-    if (IsExcludedProcessId(processId)) {
+    if (processId == 0) {
         return;
     }
 
@@ -551,6 +601,8 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
                                        RtlReAllocateHeapFn reallocateHeap,
                                        PVOID heap,
                                        NtOpenThreadFn openThread,
+                                       NtGetNextThreadFn getNextThread,
+                                       NtQueryInformationThreadFn queryThread,
                                        NtSetInformationThreadFn setThread,
                                        NtOpenProcessFn openProcess,
                                        NtSetInformationProcessFn setProcess,
@@ -569,9 +621,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
     auto* process = reinterpret_cast<NativeSystemProcessInformation*>(buffer);
 
     for (;;) {
-        const DWORD snapshotProcessId = static_cast<DWORD>(
-            reinterpret_cast<ULONG_PTR>(process->UniqueProcessId));
-        const bool skipProcess = IsExcludedProcess(snapshotProcessId, process->ImageName);
+        const bool skipProcess = IsExcludedProcess(process->ImageName);
         const ULONG threadCount = process->NumberOfThreads;
         const NativeSystemThreadInformation* thread = process->Threads;
 
@@ -583,7 +633,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
 
                 const DWORD processId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(thread->ClientId.UniqueProcess));
                 const DWORD threadId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(thread->ClientId.UniqueThread));
-                if (threadId == 0 || threadId == currentThreadId || IsExcludedProcessId(processId)) {
+                if (threadId == 0 || threadId == currentThreadId) {
                     continue;
                 }
 
@@ -596,7 +646,16 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
 
                 DWORD error = ERROR_SUCCESS;
                 uint8_t openFailureKind = kOpenFailureOther;
-                if (FixPriority16Thread(openThread, setThread, closeHandle, processId, threadId, error, openFailureKind)) {
+                if (FixPriority16Thread(openThread,
+                                        getNextThread,
+                                        queryThread,
+                                        setThread,
+                                        openProcess,
+                                        closeHandle,
+                                        processId,
+                                        threadId,
+                                        error,
+                                        openFailureKind)) {
                     ++stats.fixedPriority16;
                     RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
                 } else if (error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_PARAMETER) {
@@ -689,7 +748,7 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
 
             const DWORD processId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueProcess));
             const DWORD threadId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueThread));
-            if (threadId == 0 || threadId == currentThreadId || IsExcludedProcessId(processId)) {
+            if (threadId == 0 || threadId == currentThreadId) {
                 continue;
             }
 
@@ -798,8 +857,31 @@ int wmain(int argc, wchar_t** argv) {
     do {
         const bool globalRefresh = intervalMs == 0 || scanId == 1 || (scanId % kGlobalRefreshScans) == 0;
         const ScanStats stats = globalRefresh
-            ? ScanAndFixPriority16(query, allocateHeap, reallocateHeap, heap, openThread, setThread, openProcess, setProcess, closeHandle, buffer, capacity, threadCache, processCache, scanId++)
-            : ScanCachedPriority16Processes(getNextThread, queryThread, setThread, openProcess, setProcess, closeHandle, threadCache, processCache, scanId++);
+            ? ScanAndFixPriority16(query,
+                                   allocateHeap,
+                                   reallocateHeap,
+                                   heap,
+                                   openThread,
+                                   getNextThread,
+                                   queryThread,
+                                   setThread,
+                                   openProcess,
+                                   setProcess,
+                                   closeHandle,
+                                   buffer,
+                                   capacity,
+                                   threadCache,
+                                   processCache,
+                                   scanId++)
+            : ScanCachedPriority16Processes(getNextThread,
+                                            queryThread,
+                                            setThread,
+                                            openProcess,
+                                            setProcess,
+                                            closeHandle,
+                                            threadCache,
+                                            processCache,
+                                            scanId++);
         if (intervalMs == 0 || stats.fixedPriority16 != 0 || stats.openFailures != 0 || stats.fixFailures != 0) {
             std::printf("priority16_seen=%u priority16_fixed=%u cached_skipped=%u open_failures=%u protected_failures=%u transient_failures=%u fix_failures=%u\n",
                         stats.seenPriority16,
