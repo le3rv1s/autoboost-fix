@@ -106,8 +106,9 @@ struct SYSTEM_PROCESS_INFORMATION_T {
     SYSTEM_THREAD_INFORMATION_T Threads[1];
 };
 
-using NtAllocateVirtualMemoryFn = NTSTATUS_T(NTAPI*)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
-using NtFreeVirtualMemoryFn = NTSTATUS_T(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG);
+using RtlAllocateHeapFn = PVOID(NTAPI*)(PVOID, ULONG, SIZE_T);
+using RtlFreeHeapFn = BOOLEAN(NTAPI*)(PVOID, ULONG, PVOID);
+using RtlGetProcessHeapFn = PVOID(NTAPI*)();
 using NtOpenProcessTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, ACCESS_MASK, PHANDLE);
 using NtAdjustPrivilegesTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, BOOLEAN, PTOKEN_PRIVILEGES, ULONG, PTOKEN_PRIVILEGES, PULONG);
 using NtQueryInformationTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -168,8 +169,9 @@ static HANDLE NtCurrentProcessHandle() noexcept {
     return reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-1));
 }
 
-static void EnableAllTokenPrivileges(NtAllocateVirtualMemoryFn allocateMemory,
-                                     NtFreeVirtualMemoryFn freeMemory,
+static void EnableAllTokenPrivileges(RtlAllocateHeapFn allocateHeap,
+                                     RtlFreeHeapFn freeHeap,
+                                     PVOID heap,
                                      NtOpenProcessTokenFn openProcessToken,
                                      NtQueryInformationTokenFn queryToken,
                                      NtAdjustPrivilegesTokenFn adjustToken,
@@ -186,16 +188,15 @@ static void EnableAllTokenPrivileges(NtAllocateVirtualMemoryFn allocateMemory,
         return;
     }
 
-    PVOID privileges = nullptr;
-    SIZE_T privilegesSize = required;
-    if (allocateMemory(NtCurrentProcessHandle(), &privileges, 0, &privilegesSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) < 0) {
+    PVOID privileges = allocateHeap(heap, 0, required);
+    if (privileges == nullptr) {
         closeHandle(token);
         return;
     }
 
     auto* tokenPrivileges = reinterpret_cast<TOKEN_PRIVILEGES*>(privileges);
     if (queryToken(token, TokenPrivileges, tokenPrivileges, required, &required) < 0) {
-        freeMemory(NtCurrentProcessHandle(), &privileges, &privilegesSize, MEM_RELEASE);
+        freeHeap(heap, 0, privileges);
         closeHandle(token);
         return;
     }
@@ -205,7 +206,7 @@ static void EnableAllTokenPrivileges(NtAllocateVirtualMemoryFn allocateMemory,
     }
 
     adjustToken(token, FALSE, tokenPrivileges, required, nullptr, nullptr);
-    freeMemory(NtCurrentProcessHandle(), &privileges, &privilegesSize, MEM_RELEASE);
+    freeHeap(heap, 0, privileges);
     closeHandle(token);
 }
 
@@ -270,30 +271,27 @@ static uint32_t ReadIntervalMs(int argc, wchar_t** argv) noexcept {
 }
 
 static bool QueryProcessSnapshot(NtQuerySystemInformationFn query,
-                                 NtAllocateVirtualMemoryFn allocateMemory,
-                                 NtFreeVirtualMemoryFn freeMemory,
+                                 RtlAllocateHeapFn allocateHeap,
+                                 RtlFreeHeapFn freeHeap,
+                                 PVOID heap,
                                  PVOID& buffer,
                                  ULONG& capacity) noexcept {
     ULONG required = 0;
     NTSTATUS_T status = query(SystemProcessInformation, buffer, capacity, &required);
     if (status == STATUS_INFO_LENGTH_MISMATCH) {
         const ULONG nextCapacity = required > capacity ? required + (64U * 1024U) : capacity * 2U;
-        PVOID nextBuffer = nullptr;
-        SIZE_T nextSize = nextCapacity;
-        if (allocateMemory(NtCurrentProcessHandle(), &nextBuffer, 0, &nextSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) < 0) {
+        PVOID nextBuffer = allocateHeap(heap, 0, nextCapacity);
+        if (nextBuffer == nullptr) {
             return false;
         }
 
         status = query(SystemProcessInformation, nextBuffer, nextCapacity, &required);
         if (status < 0) {
-            SIZE_T failedSize = 0;
-            freeMemory(NtCurrentProcessHandle(), &nextBuffer, &failedSize, MEM_RELEASE);
+            freeHeap(heap, 0, nextBuffer);
             return false;
         }
 
-        PVOID oldBuffer = buffer;
-        SIZE_T oldSize = 0;
-        freeMemory(NtCurrentProcessHandle(), &oldBuffer, &oldSize, MEM_RELEASE);
+        freeHeap(heap, 0, buffer);
         buffer = nextBuffer;
         capacity = nextCapacity;
         return true;
@@ -410,8 +408,9 @@ static void RememberProcess(ProcessCache& cache,
 }
 
 static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
-                                       NtAllocateVirtualMemoryFn allocateMemory,
-                                       NtFreeVirtualMemoryFn freeMemory,
+                                       RtlAllocateHeapFn allocateHeap,
+                                       RtlFreeHeapFn freeHeap,
+                                       PVOID heap,
                                        NtOpenThreadFn openThread,
                                        NtSetInformationThreadFn setThread,
                                        NtOpenProcessFn openProcess,
@@ -423,7 +422,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
                                        ProcessCache& processCache,
                                        uint32_t scanId) noexcept {
     ScanStats stats{};
-    if (!QueryProcessSnapshot(query, allocateMemory, freeMemory, buffer, capacity)) {
+    if (!QueryProcessSnapshot(query, allocateHeap, freeHeap, heap, buffer, capacity)) {
         return stats;
     }
 
@@ -565,10 +564,9 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 
-    const auto allocateMemory = reinterpret_cast<NtAllocateVirtualMemoryFn>(
-        GetProcAddress(ntdll, "NtAllocateVirtualMemory"));
-    const auto freeMemory = reinterpret_cast<NtFreeVirtualMemoryFn>(
-        GetProcAddress(ntdll, "NtFreeVirtualMemory"));
+    const auto allocateHeap = reinterpret_cast<RtlAllocateHeapFn>(GetProcAddress(ntdll, "RtlAllocateHeap"));
+    const auto freeHeap = reinterpret_cast<RtlFreeHeapFn>(GetProcAddress(ntdll, "RtlFreeHeap"));
+    const auto getProcessHeap = reinterpret_cast<RtlGetProcessHeapFn>(GetProcAddress(ntdll, "RtlGetProcessHeap"));
     const auto openProcessToken = reinterpret_cast<NtOpenProcessTokenFn>(
         GetProcAddress(ntdll, "NtOpenProcessToken"));
     const auto queryToken = reinterpret_cast<NtQueryInformationTokenFn>(
@@ -580,14 +578,20 @@ int wmain(int argc, wchar_t** argv) {
         GetProcAddress(ntdll, "NtSetInformationProcess"));
     const auto closeHandle = reinterpret_cast<NtCloseFn>(GetProcAddress(ntdll, "NtClose"));
     const auto delayExecution = reinterpret_cast<NtDelayExecutionFn>(GetProcAddress(ntdll, "NtDelayExecution"));
-    if (allocateMemory == nullptr || freeMemory == nullptr || openProcessToken == nullptr ||
+    if (allocateHeap == nullptr || freeHeap == nullptr || getProcessHeap == nullptr || openProcessToken == nullptr ||
         queryToken == nullptr || adjustToken == nullptr || openProcess == nullptr || setProcess == nullptr ||
         closeHandle == nullptr || delayExecution == nullptr) {
         std::fputs("required ntdll memory APIs are unavailable\n", stderr);
         return 1;
     }
 
-    EnableAllTokenPrivileges(allocateMemory, freeMemory, openProcessToken, queryToken, adjustToken, closeHandle);
+    PVOID heap = getProcessHeap();
+    if (heap == nullptr) {
+        std::fputs("RtlGetProcessHeap failed\n", stderr);
+        return 1;
+    }
+
+    EnableAllTokenPrivileges(allocateHeap, freeHeap, heap, openProcessToken, queryToken, adjustToken, closeHandle);
 
     const auto openThread = reinterpret_cast<NtOpenThreadFn>(GetProcAddress(ntdll, "NtOpenThread"));
     const auto query = reinterpret_cast<NtQuerySystemInformationFn>(
@@ -604,9 +608,8 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     ULONG capacity = 1024U * 1024U;
-    PVOID buffer = nullptr;
-    SIZE_T bufferSize = capacity;
-    if (allocateMemory(NtCurrentProcessHandle(), &buffer, 0, &bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) < 0) {
+    PVOID buffer = allocateHeap(heap, 0, capacity);
+    if (buffer == nullptr) {
         std::fputs("failed to allocate snapshot buffer\n", stderr);
         return 1;
     }
@@ -623,7 +626,7 @@ int wmain(int argc, wchar_t** argv) {
     do {
         const bool globalRefresh = intervalMs == 0 || scanId == 1 || (scanId % kGlobalRefreshScans) == 0;
         const ScanStats stats = globalRefresh
-            ? ScanAndFixPriority16(query, allocateMemory, freeMemory, openThread, setThread, openProcess, setProcess, closeHandle, buffer, capacity, threadCache, processCache, scanId++)
+            ? ScanAndFixPriority16(query, allocateHeap, freeHeap, heap, openThread, setThread, openProcess, setProcess, closeHandle, buffer, capacity, threadCache, processCache, scanId++)
             : ScanCachedPriority16Processes(getNextThread, queryThread, setThread, openProcess, setProcess, closeHandle, threadCache, processCache, scanId++);
         if (intervalMs == 0 || stats.fixedPriority16 != 0 || stats.openFailures != 0 || stats.fixFailures != 0) {
             std::printf("priority16_seen=%u priority16_fixed=%u cached_skipped=%u open_failures=%u fix_failures=%u\n",
@@ -643,8 +646,6 @@ int wmain(int argc, wchar_t** argv) {
         delayExecution(FALSE, &delay);
     } while (true);
 
-    PVOID releaseBuffer = buffer;
-    SIZE_T releaseSize = 0;
-    freeMemory(NtCurrentProcessHandle(), &releaseBuffer, &releaseSize, MEM_RELEASE);
+    freeHeap(heap, 0, buffer);
     return 0;
 }
