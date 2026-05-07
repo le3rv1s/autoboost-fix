@@ -18,6 +18,7 @@ struct UNICODE_STRING_T {
 constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH = static_cast<NTSTATUS_T>(0xC0000004L);
 constexpr ULONG SystemProcessInformation = 5;
 constexpr KPRIORITY kTargetPriority = 16;
+constexpr uint32_t kDefaultIntervalMs = 1000;
 
 struct CLIENT_ID_T {
     HANDLE UniqueProcess;
@@ -71,13 +72,13 @@ struct ScanStats {
 
 static uint32_t ReadIntervalMs(int argc, wchar_t** argv) noexcept {
     if (argc < 2) {
-        return 0;
+        return kDefaultIntervalMs;
     }
 
     wchar_t* end = nullptr;
     const unsigned long value = wcstoul(argv[1], &end, 10);
     if (end == argv[1] || *end != L'\0' || value > 60000UL) {
-        return 0;
+        return kDefaultIntervalMs;
     }
 
     return static_cast<uint32_t>(value);
@@ -131,7 +132,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
         const SYSTEM_THREAD_INFORMATION_T* thread = process->Threads;
 
         for (ULONG i = 0; i < threadCount; ++i, ++thread) {
-            if (thread->Priority != kTargetPriority) {
+            if (thread->Priority != kTargetPriority && thread->BasePriority != kTargetPriority) {
                 continue;
             }
 
@@ -181,6 +182,11 @@ int wmain(int argc, wchar_t** argv) {
     ULONG capacity = 1024U * 1024U;
     auto buffer = std::make_unique<BYTE[]>(capacity);
     const uint32_t intervalMs = ReadIntervalMs(argc, argv);
+
+    if (intervalMs != 0) {
+        std::printf("monitoring priority 16 threads every %u ms; pass 0 as interval for one scan\n",
+                    intervalMs);
+    }
 
     do {
         const ScanStats stats = ScanAndFixPriority16(query, buffer, capacity);
