@@ -38,6 +38,8 @@ constexpr uint8_t kCacheDenied = 2;
 constexpr uint8_t kCacheFailed = 3;
 constexpr ACCESS_MASK kThreadFixAccess = THREAD_SET_LIMITED_INFORMATION;
 constexpr ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
+constexpr DWORD kProcessEnumAccess = PROCESS_QUERY_LIMITED_INFORMATION;
+constexpr DWORD kProcessBoostAccess = PROCESS_SET_INFORMATION;
 
 struct CLIENT_ID_T {
     HANDLE UniqueProcess;
@@ -143,19 +145,31 @@ struct ProcessCache {
 };
 
 
-static void EnableDebugPrivilege() noexcept {
+static void EnableAllTokenPrivileges() noexcept {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
         return;
     }
 
-    TOKEN_PRIVILEGES privileges{};
-    privileges.PrivilegeCount = 1;
-    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &privileges.Privileges[0].Luid)) {
-        AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr);
+    DWORD required = 0;
+    GetTokenInformation(token, TokenPrivileges, nullptr, 0, &required);
+    if (required == 0) {
+        CloseHandle(token);
+        return;
     }
 
+    auto privileges = std::make_unique<BYTE[]>(required);
+    auto* tokenPrivileges = reinterpret_cast<TOKEN_PRIVILEGES*>(privileges.get());
+    if (!GetTokenInformation(token, TokenPrivileges, tokenPrivileges, required, &required)) {
+        CloseHandle(token);
+        return;
+    }
+
+    for (DWORD i = 0; i < tokenPrivileges->PrivilegeCount; ++i) {
+        tokenPrivileges->Privileges[i].Attributes |= SE_PRIVILEGE_ENABLED;
+    }
+
+    AdjustTokenPrivileges(token, FALSE, tokenPrivileges, required, nullptr, nullptr);
     CloseHandle(token);
 }
 
@@ -271,11 +285,17 @@ static bool FixPriority16Thread(NtSetInformationThreadFn setThread, DWORD thread
 }
 
 static HANDLE OpenCachedProcess(DWORD processId) noexcept {
-    return OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, FALSE, processId);
+    return OpenProcess(kProcessEnumAccess, FALSE, processId);
 }
 
-static void DisableProcessPriorityBoost(HANDLE process) noexcept {
+static void DisableProcessPriorityBoost(DWORD processId) noexcept {
+    HANDLE process = OpenProcess(kProcessBoostAccess, FALSE, processId);
+    if (process == nullptr) {
+        return;
+    }
+
     SetProcessPriorityBoost(process, TRUE);
+    CloseHandle(process);
 }
 
 static void RememberProcess(ProcessCache& cache, DWORD processId, uint32_t scanId) noexcept {
@@ -312,12 +332,8 @@ static void RememberProcess(ProcessCache& cache, DWORD processId, uint32_t scanI
         CloseHandle(cache.entries[slot].process);
     }
 
-    HANDLE process = OpenCachedProcess(processId);
-    if (process != nullptr) {
-        DisableProcessPriorityBoost(process);
-    }
-
-    cache.entries[slot] = ProcessCacheEntry{processId, process, scanId};
+    DisableProcessPriorityBoost(processId);
+    cache.entries[slot] = ProcessCacheEntry{processId, OpenCachedProcess(processId), scanId};
 }
 
 static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
@@ -401,7 +417,7 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
                 continue;
             }
 
-            DisableProcessPriorityBoost(processEntry.process);
+            DisableProcessPriorityBoost(processEntry.processId);
         }
 
         HANDLE previousThread = nullptr;
@@ -467,7 +483,7 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 
-    EnableDebugPrivilege();
+    EnableAllTokenPrivileges();
 
     const auto query = reinterpret_cast<NtQuerySystemInformationFn>(
         GetProcAddress(ntdll, "NtQuerySystemInformation"));
