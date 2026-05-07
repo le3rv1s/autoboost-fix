@@ -143,7 +143,7 @@ struct NativeSystemProcessInformation {
     SIZE_T QuotaPagedPoolUsage;
     SIZE_T QuotaPeakNonPagedPoolUsage;
     SIZE_T QuotaNonPagedPoolUsage;
-using NtGetNextProcessFn = NTSTATUS_T(NTAPI*)(HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
+using NtGetNextProcessPtr = NTSTATUS_T(NTAPI*)(HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
     SIZE_T PagefileUsage;
     SIZE_T PeakPagefileUsage;
     SIZE_T PrivatePageCount;
@@ -658,29 +658,7 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
         ProcessCacheEntry& processEntry = processCache.entries[(processCursor + visited) % kProcessCacheSize];
         ++visited;
         if (processEntry.processId == 0) {
-static HANDLE NextDiscoveryProcess(NtGetNextProcessFn getNextProcess,
-    NtCloseFn closeHandle,
-    HANDLE& processCursor) noexcept {
-    HANDLE nextProcess = nullptr;
-    const NTSTATUS_T status = getNextProcess(processCursor,
-        kProcessEnumAccess,
-        0,
-        0,
-        &nextProcess);
-    if (processCursor != nullptr) {
-        closeHandle(processCursor);
-        processCursor = nullptr;
-    }
-
-    if (status < 0 || nextProcess == nullptr) {
-        return nullptr;
-    }
-
-    processCursor = nextProcess;
-    return nextProcess;
-}
-
-static ScanStats DiscoverPriority16Processes(NtGetNextProcessFn getNextProcess,
+static ScanStats DiscoverPriority16Processes(NtGetNextProcessPtr getNextProcess,
     NtGetNextThreadFn getNextThread,
     NtQueryInformationThreadFn queryThread,
     NtSetInformationThreadFn setThread,
@@ -695,13 +673,29 @@ static ScanStats DiscoverPriority16Processes(NtGetNextProcessFn getNextProcess,
 
     size_t scannedProcesses = 0;
     while (scannedProcesses < kDiscoveryProcessesPerRefresh) {
-        HANDLE process = NextDiscoveryProcess(getNextProcess, closeHandle, discoveryProcessCursor);
-        if (process == nullptr) {
-            process = NextDiscoveryProcess(getNextProcess, closeHandle, discoveryProcessCursor);
-            if (process == nullptr) {
+        HANDLE process = nullptr;
+        NTSTATUS_T status = getNextProcess(discoveryProcessCursor,
+            kProcessEnumAccess,
+            0,
+            0,
+            &process);
+        if (discoveryProcessCursor != nullptr) {
+            closeHandle(discoveryProcessCursor);
+            discoveryProcessCursor = nullptr;
+        }
+
+        if (status < 0 || process == nullptr) {
+            status = getNextProcess(nullptr,
+                kProcessEnumAccess,
+                0,
+                0,
+                &process);
+            if (status < 0 || process == nullptr) {
                 break;
             }
         }
+
+        discoveryProcessCursor = process;
         ++scannedProcesses;
 
         const DWORD processIdForCache = GetProcessId(process);
@@ -709,7 +703,7 @@ static ScanStats DiscoverPriority16Processes(NtGetNextProcessFn getNextProcess,
         size_t scannedThreads = 0;
         for (;;) {
             HANDLE thread = nullptr;
-            const NTSTATUS_T status = getNextThread(process,
+            status = getNextThread(process,
                 previousThread,
                 kThreadQueryFixAccess,
                 0,
@@ -717,6 +711,7 @@ static ScanStats DiscoverPriority16Processes(NtGetNextProcessFn getNextProcess,
                 &thread);
             if (previousThread != nullptr) {
                 closeHandle(previousThread);
+                previousThread = nullptr;
             }
 
             if (status < 0 || thread == nullptr) {
@@ -725,6 +720,8 @@ static ScanStats DiscoverPriority16Processes(NtGetNextProcessFn getNextProcess,
 
             previousThread = thread;
             if (++scannedThreads > kDiscoveryThreadsPerProcess) {
+                closeHandle(previousThread);
+                previousThread = nullptr;
                 break;
             }
 
@@ -918,7 +915,7 @@ int wmain(int argc, wchar_t** argv) {
         capacity = 64U * 1024U;
         buffer = allocateHeap(heap, 0, capacity);
     }
-    const auto getNextProcess = reinterpret_cast<NtGetNextProcessFn>(
+    const auto getNextProcess = reinterpret_cast<NtGetNextProcessPtr>(
         GetProcAddress(ntdll, "NtGetNextProcess"));
     if (openThread == nullptr || query == nullptr || queryThread == nullptr ||
         setThread == nullptr || getNextThread == nullptr || getNextProcess == nullptr) {
