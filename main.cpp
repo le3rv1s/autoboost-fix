@@ -36,6 +36,9 @@ struct UNICODE_STRING_T {
 };
 
 constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH = static_cast<NTSTATUS_T>(0xC0000004L);
+constexpr NTSTATUS_T STATUS_ACCESS_DENIED = static_cast<NTSTATUS_T>(0xC0000022L);
+constexpr NTSTATUS_T STATUS_INVALID_CID = static_cast<NTSTATUS_T>(0xC000000BL);
+constexpr NTSTATUS_T STATUS_INVALID_PARAMETER = static_cast<NTSTATUS_T>(0xC000000DL);
 constexpr ULONG SystemProcessInformation = 5;
 constexpr KPRIORITY kTargetPriority = 16;
 constexpr ULONG kHeapGrowable = 0x00000002;
@@ -53,6 +56,9 @@ constexpr ACCESS_MASK kThreadSetAccess = THREAD_SET_INFORMATION;
 constexpr ACCESS_MASK kThreadQuerySetAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
 constexpr ACCESS_MASK kThreadFullQuerySetAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION;
 constexpr ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
+constexpr uint8_t kOpenFailureProtected = 1;
+constexpr uint8_t kOpenFailureTransient = 2;
+constexpr uint8_t kOpenFailureOther = 3;
 constexpr DWORD kProcessEnumAccess = PROCESS_QUERY_LIMITED_INFORMATION;
 constexpr DWORD kProcessBoostAccess = PROCESS_SET_INFORMATION;
 
@@ -158,6 +164,8 @@ struct ScanStats {
     uint32_t fixedPriority16 = 0;
     uint32_t cachedSkipped = 0;
     uint32_t openFailures = 0;
+    uint32_t protectedFailures = 0;
+    uint32_t transientFailures = 0;
     uint32_t fixFailures = 0;
 };
 
@@ -324,23 +332,36 @@ static bool FixPriority16ThreadHandle(NtSetInformationThreadFn setThread, HANDLE
     return true;
 }
 
-static bool TryOpenPriorityThread(NtOpenThreadFn openThread,
-                                  DWORD processId,
-                                  DWORD threadId,
-                                  ACCESS_MASK access,
-                                  bool includeProcessId,
-                                  HANDLE& thread) noexcept {
+static NTSTATUS_T TryOpenPriorityThread(NtOpenThreadFn openThread,
+                                        DWORD processId,
+                                        DWORD threadId,
+                                        ACCESS_MASK access,
+                                        bool includeProcessId,
+                                        HANDLE& thread) noexcept {
     thread = nullptr;
     OBJECT_ATTRIBUTES_T attributes{sizeof(attributes), nullptr, nullptr, 0, nullptr, nullptr};
     CLIENT_ID_T clientId{includeProcessId ? reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(processId)) : nullptr,
                          reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(threadId))};
-    return openThread(&thread, access, &attributes, &clientId) >= 0 && thread != nullptr;
+    return openThread(&thread, access, &attributes, &clientId);
+}
+
+static uint8_t ClassifyOpenStatus(NTSTATUS_T status) noexcept {
+    if (status == STATUS_INVALID_CID || status == STATUS_INVALID_PARAMETER) {
+        return kOpenFailureTransient;
+    }
+
+    if (status == STATUS_ACCESS_DENIED) {
+        return kOpenFailureProtected;
+    }
+
+    return kOpenFailureOther;
 }
 
 static bool OpenPriorityFixThread(NtOpenThreadFn openThread,
                                   DWORD processId,
                                   DWORD threadId,
-                                  HANDLE& thread) noexcept {
+                                  HANDLE& thread,
+                                  uint8_t& failureKind) noexcept {
     constexpr ACCESS_MASK accessMasks[] = {
         kThreadFixAccess,
         kThreadSetAccess,
@@ -349,13 +370,20 @@ static bool OpenPriorityFixThread(NtOpenThreadFn openThread,
         THREAD_ALL_ACCESS
     };
 
+    NTSTATUS_T lastStatus = STATUS_ACCESS_DENIED;
     for (const ACCESS_MASK access : accessMasks) {
-        if (TryOpenPriorityThread(openThread, processId, threadId, access, true, thread) ||
-            TryOpenPriorityThread(openThread, processId, threadId, access, false, thread)) {
+        lastStatus = TryOpenPriorityThread(openThread, processId, threadId, access, true, thread);
+        if (lastStatus >= 0 && thread != nullptr) {
+            return true;
+        }
+
+        lastStatus = TryOpenPriorityThread(openThread, processId, threadId, access, false, thread);
+        if (lastStatus >= 0 && thread != nullptr) {
             return true;
         }
     }
 
+    failureKind = ClassifyOpenStatus(lastStatus);
     return false;
 }
 
@@ -364,10 +392,11 @@ static bool FixPriority16Thread(NtOpenThreadFn openThread,
                                 NtCloseFn closeHandle,
                                 DWORD processId,
                                 DWORD threadId,
-                                DWORD& error) noexcept {
+                                DWORD& error,
+                                uint8_t& openFailureKind) noexcept {
     error = ERROR_SUCCESS;
     HANDLE thread = nullptr;
-    if (!OpenPriorityFixThread(openThread, processId, threadId, thread)) {
+    if (!OpenPriorityFixThread(openThread, processId, threadId, thread, openFailureKind)) {
         error = ERROR_ACCESS_DENIED;
         return false;
     }
@@ -494,12 +523,20 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
             }
 
             DWORD error = ERROR_SUCCESS;
-            if (FixPriority16Thread(openThread, setThread, closeHandle, processId, threadId, error)) {
+            uint8_t openFailureKind = kOpenFailureOther;
+            if (FixPriority16Thread(openThread, setThread, closeHandle, processId, threadId, error, openFailureKind)) {
                 ++stats.fixedPriority16;
                 RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
             } else if (error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_PARAMETER) {
                 ++stats.openFailures;
-                RememberThread(threadCache, processId, threadId, scanId, kCacheDenied);
+                if (openFailureKind == kOpenFailureTransient) {
+                    ++stats.transientFailures;
+                } else if (openFailureKind == kOpenFailureProtected) {
+                    ++stats.protectedFailures;
+                }
+
+                RememberThread(threadCache, processId, threadId, scanId,
+                               openFailureKind == kOpenFailureTransient ? kCacheEmpty : kCacheDenied);
             } else {
                 ++stats.fixFailures;
                 RememberThread(threadCache, processId, threadId, scanId, kCacheFailed);
@@ -680,11 +717,13 @@ int wmain(int argc, wchar_t** argv) {
             ? ScanAndFixPriority16(query, allocateHeap, reallocateHeap, heap, openThread, setThread, openProcess, setProcess, closeHandle, buffer, capacity, threadCache, processCache, scanId++)
             : ScanCachedPriority16Processes(getNextThread, queryThread, setThread, openProcess, setProcess, closeHandle, threadCache, processCache, scanId++);
         if (intervalMs == 0 || stats.fixedPriority16 != 0 || stats.openFailures != 0 || stats.fixFailures != 0) {
-            std::printf("priority16_seen=%u priority16_fixed=%u cached_skipped=%u open_failures=%u fix_failures=%u\n",
+            std::printf("priority16_seen=%u priority16_fixed=%u cached_skipped=%u open_failures=%u protected_failures=%u transient_failures=%u fix_failures=%u\n",
                         stats.seenPriority16,
                         stats.fixedPriority16,
                         stats.cachedSkipped,
                         stats.openFailures,
+                        stats.protectedFailures,
+                        stats.transientFailures,
                         stats.fixFailures);
         }
 
