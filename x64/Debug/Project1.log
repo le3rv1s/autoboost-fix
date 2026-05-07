@@ -1,0 +1,7 @@
+﻿  main.cpp
+F:\Project1\Project1\main.cpp(161,25): error C2589: '(': illegal token on right side of '::'
+F:\Project1\Project1\main.cpp(161,25): error C2059: syntax error: ')'
+F:\Project1\Project1\main.cpp(203,9): error C2664: 'NTSTATUS (HANDLE,THREADINFOCLASS,PVOID,ULONG)': cannot convert argument 3 from 'const LONG *' to 'PVOID'
+      F:\Project1\Project1\main.cpp(203,9):
+      Conversion loses qualifiers
+  
