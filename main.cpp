@@ -18,7 +18,7 @@ struct UNICODE_STRING_T {
 constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH = static_cast<NTSTATUS_T>(0xC0000004L);
 constexpr ULONG SystemProcessInformation = 5;
 constexpr KPRIORITY kTargetPriority = 16;
-constexpr uint32_t kDefaultIntervalMs = 1000;
+constexpr uint32_t kDefaultIntervalMs = 10000;
 
 struct CLIENT_ID_T {
     HANDLE UniqueProcess;
@@ -42,22 +42,38 @@ struct SYSTEM_THREAD_INFORMATION_T {
 struct SYSTEM_PROCESS_INFORMATION_T {
     ULONG NextEntryOffset;
     ULONG NumberOfThreads;
-    BYTE Reserved1[48];
+    LARGE_INTEGER WorkingSetPrivateSize;
+    ULONG HardFaultCount;
+    ULONG NumberOfThreadsHighWatermark;
+    ULONGLONG CycleTime;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
     UNICODE_STRING_T ImageName;
     KPRIORITY BasePriority;
     HANDLE UniqueProcessId;
-    PVOID Reserved2;
+    HANDLE InheritedFromUniqueProcessId;
     ULONG HandleCount;
     ULONG SessionId;
-    ULONG_PTR Reserved3;
+    ULONG_PTR UniqueProcessKey;
     SIZE_T PeakVirtualSize;
     SIZE_T VirtualSize;
-    ULONG Reserved4;
+    ULONG PageFaultCount;
     SIZE_T PeakWorkingSetSize;
     SIZE_T WorkingSetSize;
-    PVOID Reserved5[4];
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
     SIZE_T PrivatePageCount;
-    LARGE_INTEGER Reserved6[6];
+    LARGE_INTEGER ReadOperationCount;
+    LARGE_INTEGER WriteOperationCount;
+    LARGE_INTEGER OtherOperationCount;
+    LARGE_INTEGER ReadTransferCount;
+    LARGE_INTEGER WriteTransferCount;
+    LARGE_INTEGER OtherTransferCount;
     SYSTEM_THREAD_INFORMATION_T Threads[1];
 };
 
@@ -184,17 +200,19 @@ int wmain(int argc, wchar_t** argv) {
     const uint32_t intervalMs = ReadIntervalMs(argc, argv);
 
     if (intervalMs != 0) {
-        std::printf("monitoring priority 16 threads every %u ms; pass 0 as interval for one scan\n",
+        std::printf("monitoring priority 16 threads every %u ms; quiet until a candidate is found; pass 0 for one scan\n",
                     intervalMs);
     }
 
     do {
         const ScanStats stats = ScanAndFixPriority16(query, buffer, capacity);
-        std::printf("priority16_seen=%u priority16_fixed=%u open_failures=%u fix_failures=%u\n",
-                    stats.seenPriority16,
-                    stats.fixedPriority16,
-                    stats.openFailures,
-                    stats.fixFailures);
+        if (intervalMs == 0 || stats.seenPriority16 != 0 || stats.openFailures != 0 || stats.fixFailures != 0) {
+            std::printf("priority16_seen=%u priority16_fixed=%u open_failures=%u fix_failures=%u\n",
+                        stats.seenPriority16,
+                        stats.fixedPriority16,
+                        stats.openFailures,
+                        stats.fixFailures);
+        }
 
         if (intervalMs == 0) {
             break;
