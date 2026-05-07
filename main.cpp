@@ -26,7 +26,7 @@ struct UNICODE_STRING_T {
 constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH = static_cast<NTSTATUS_T>(0xC0000004L);
 constexpr ULONG SystemProcessInformation = 5;
 constexpr KPRIORITY kTargetPriority = 16;
-constexpr ULONG HEAP_GROWABLE = 0x00000002;
+constexpr ULONG kHeapGrowable = 0x00000002;
 constexpr uint32_t kDefaultIntervalMs = 1000;
 constexpr uint32_t kGlobalRefreshScans = 60;
 constexpr uint32_t kRetryCooldownScans = 256;
@@ -586,7 +586,7 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
 
-    PVOID heap = createHeap(HEAP_GROWABLE, nullptr, 0, 0, nullptr, nullptr);
+    PVOID heap = createHeap(kHeapGrowable, nullptr, 0, 0, nullptr, nullptr);
     if (heap == nullptr) {
         std::fputs("RtlCreateHeap failed\n", stderr);
         return 1;
