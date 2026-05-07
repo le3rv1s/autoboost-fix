@@ -26,20 +26,45 @@
 #define THREAD_ALL_ACCESS 0x001FFFFF
 #endif
 
+#ifdef kThreadSetAccess
+#undef kThreadSetAccess
+#endif
+#ifdef kThreadQuerySetAccess
+#undef kThreadQuerySetAccess
+#endif
+#ifdef kThreadFullQuerySetAccess
+#undef kThreadFullQuerySetAccess
+#endif
+#ifdef kProcessEnumAccess
+#undef kProcessEnumAccess
+#endif
+#ifdef kProcessBoostAccess
+#undef kProcessBoostAccess
+#endif
+#ifdef kOpenFailureProtected
+#undef kOpenFailureProtected
+#endif
+#ifdef kOpenFailureTransient
+#undef kOpenFailureTransient
+#endif
+#ifdef kOpenFailureOther
+#undef kOpenFailureOther
+#endif
+
 using NTSTATUS_T = LONG;
 using KPRIORITY = LONG;
 
-struct UNICODE_STRING_T {
+struct NativeUnicodeString {
     USHORT Length;
     USHORT MaximumLength;
     PWSTR Buffer;
 };
 
-constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH = static_cast<NTSTATUS_T>(0xC0000004L);
-constexpr NTSTATUS_T STATUS_ACCESS_DENIED = static_cast<NTSTATUS_T>(0xC0000022L);
-constexpr NTSTATUS_T STATUS_INVALID_CID = static_cast<NTSTATUS_T>(0xC000000BL);
-constexpr NTSTATUS_T STATUS_INVALID_PARAMETER = static_cast<NTSTATUS_T>(0xC000000DL);
-constexpr ULONG SystemProcessInformation = 5;
+constexpr NTSTATUS_T kStatusInfoLengthMismatch = static_cast<NTSTATUS_T>(0xC0000004L);
+constexpr NTSTATUS_T kStatusAccessDenied = static_cast<NTSTATUS_T>(0xC0000022L);
+constexpr NTSTATUS_T kStatusInvalidCid = static_cast<NTSTATUS_T>(0xC000000BL);
+constexpr NTSTATUS_T kStatusInvalidParameter = static_cast<NTSTATUS_T>(0xC000000DL);
+constexpr ULONG kSystemProcessInformation = 5;
 constexpr KPRIORITY kTargetPriority = 16;
 constexpr ULONG kHeapGrowable = 0x00000002;
 constexpr uint32_t kDefaultIntervalMs = 1000;
@@ -51,23 +76,23 @@ constexpr uint8_t kCacheEmpty = 0;
 constexpr uint8_t kCacheFixed = 1;
 constexpr uint8_t kCacheDenied = 2;
 constexpr uint8_t kCacheFailed = 3;
-constexpr ACCESS_MASK kThreadFixAccess = THREAD_SET_LIMITED_INFORMATION;
-constexpr ACCESS_MASK kThreadSetAccess = THREAD_SET_INFORMATION;
-constexpr ACCESS_MASK kThreadQuerySetAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
-constexpr ACCESS_MASK kThreadFullQuerySetAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION;
-constexpr ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
+const ACCESS_MASK kThreadFixAccess = THREAD_SET_LIMITED_INFORMATION;
+const ACCESS_MASK kThreadSetAccess = THREAD_SET_INFORMATION;
+const ACCESS_MASK kThreadQuerySetAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
+const ACCESS_MASK kThreadFullQuerySetAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION;
+const ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
 constexpr uint8_t kOpenFailureProtected = 1;
 constexpr uint8_t kOpenFailureTransient = 2;
 constexpr uint8_t kOpenFailureOther = 3;
-constexpr ACCESS_MASK kProcessEnumAccess = PROCESS_QUERY_LIMITED_INFORMATION;
-constexpr ACCESS_MASK kProcessBoostAccess = PROCESS_SET_INFORMATION;
+const ACCESS_MASK kProcessEnumAccess = PROCESS_QUERY_LIMITED_INFORMATION;
+const ACCESS_MASK kProcessBoostAccess = PROCESS_SET_INFORMATION;
 
-struct CLIENT_ID_T {
+struct NativeClientId {
     HANDLE UniqueProcess;
     HANDLE UniqueThread;
 };
 
-struct OBJECT_ATTRIBUTES_T {
+struct NativeObjectAttributes {
     ULONG Length;
     HANDLE RootDirectory;
     PVOID ObjectName;
@@ -76,13 +101,13 @@ struct OBJECT_ATTRIBUTES_T {
     PVOID SecurityQualityOfService;
 };
 
-struct SYSTEM_THREAD_INFORMATION_T {
+struct NativeSystemThreadInformation {
     LARGE_INTEGER KernelTime;
     LARGE_INTEGER UserTime;
     LARGE_INTEGER CreateTime;
     ULONG WaitTime;
     PVOID StartAddress;
-    CLIENT_ID_T ClientId;
+    NativeClientId ClientId;
     KPRIORITY Priority;
     LONG BasePriority;
     ULONG ContextSwitches;
@@ -90,7 +115,7 @@ struct SYSTEM_THREAD_INFORMATION_T {
     ULONG WaitReason;
 };
 
-struct SYSTEM_PROCESS_INFORMATION_T {
+struct NativeSystemProcessInformation {
     ULONG NextEntryOffset;
     ULONG NumberOfThreads;
     LARGE_INTEGER WorkingSetPrivateSize;
@@ -100,7 +125,7 @@ struct SYSTEM_PROCESS_INFORMATION_T {
     LARGE_INTEGER CreateTime;
     LARGE_INTEGER UserTime;
     LARGE_INTEGER KernelTime;
-    UNICODE_STRING_T ImageName;
+    NativeUnicodeString ImageName;
     KPRIORITY BasePriority;
     HANDLE UniqueProcessId;
     HANDLE InheritedFromUniqueProcessId;
@@ -125,7 +150,7 @@ struct SYSTEM_PROCESS_INFORMATION_T {
     LARGE_INTEGER ReadTransferCount;
     LARGE_INTEGER WriteTransferCount;
     LARGE_INTEGER OtherTransferCount;
-    SYSTEM_THREAD_INFORMATION_T Threads[1];
+    NativeSystemThreadInformation Threads[1];
 };
 
 using RtlAllocateHeapFn = PVOID(NTAPI*)(PVOID, ULONG, SIZE_T);
@@ -136,8 +161,8 @@ using RtlReAllocateHeapFn = PVOID(NTAPI*)(PVOID, ULONG, PVOID, SIZE_T);
 using NtOpenProcessTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, ACCESS_MASK, PHANDLE);
 using NtAdjustPrivilegesTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, BOOLEAN, PTOKEN_PRIVILEGES, ULONG, PTOKEN_PRIVILEGES, PULONG);
 using NtQueryInformationTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-using NtOpenThreadFn = NTSTATUS_T(NTAPI*)(PHANDLE, ACCESS_MASK, OBJECT_ATTRIBUTES_T*, CLIENT_ID_T*);
-using NtOpenProcessFn = NTSTATUS_T(NTAPI*)(PHANDLE, ACCESS_MASK, OBJECT_ATTRIBUTES_T*, CLIENT_ID_T*);
+using NtOpenThreadFn = NTSTATUS_T(NTAPI*)(PHANDLE, ACCESS_MASK, NativeObjectAttributes*, NativeClientId*);
+using NtOpenProcessFn = NTSTATUS_T(NTAPI*)(PHANDLE, ACCESS_MASK, NativeObjectAttributes*, NativeClientId*);
 using NtSetInformationProcessFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
 using NtQuerySystemInformationFn = NTSTATUS_T(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
 using NtQueryInformationThreadFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -146,18 +171,18 @@ using NtGetNextThreadFn = NTSTATUS_T(NTAPI*)(HANDLE, HANDLE, ACCESS_MASK, ULONG,
 using NtCloseFn = NTSTATUS_T(NTAPI*)(HANDLE);
 using NtDelayExecutionFn = NTSTATUS_T(NTAPI*)(BOOLEAN, PLARGE_INTEGER);
 
-struct THREAD_BASIC_INFORMATION_T {
+struct NativeThreadBasicInformation {
     NTSTATUS_T ExitStatus;
     PVOID TebBaseAddress;
-    CLIENT_ID_T ClientId;
+    NativeClientId ClientId;
     ULONG_PTR AffinityMask;
     KPRIORITY Priority;
     LONG BasePriority;
 };
 
-constexpr ULONG ThreadBasicInformation = 0;
-constexpr ULONG ThreadPriorityBoost = 14;
-constexpr ULONG ProcessPriorityBoost = 22;
+constexpr ULONG kThreadBasicInformation = 0;
+constexpr ULONG kThreadPriorityBoost = 14;
+constexpr ULONG kProcessPriorityBoost = 22;
 
 struct ScanStats {
     uint32_t seenPriority16 = 0;
@@ -302,8 +327,8 @@ static bool QueryProcessSnapshot(NtQuerySystemInformationFn query,
                                  PVOID& buffer,
                                  ULONG& capacity) noexcept {
     ULONG required = 0;
-    NTSTATUS_T status = query(SystemProcessInformation, buffer, capacity, &required);
-    while (status == STATUS_INFO_LENGTH_MISMATCH) {
+    NTSTATUS_T status = query(kSystemProcessInformation, buffer, capacity, &required);
+    while (status == kStatusInfoLengthMismatch) {
         const ULONG nextCapacity = required > capacity ? required + (64U * 1024U) : capacity * 2U;
         PVOID nextBuffer = reallocateHeap(heap, 0, buffer, nextCapacity);
         if (nextBuffer == nullptr) {
@@ -313,7 +338,7 @@ static bool QueryProcessSnapshot(NtQuerySystemInformationFn query,
         buffer = nextBuffer;
         capacity = nextCapacity;
         required = 0;
-        status = query(SystemProcessInformation, buffer, capacity, &required);
+        status = query(kSystemProcessInformation, buffer, capacity, &required);
     }
 
     return status >= 0;
@@ -323,7 +348,7 @@ static bool FixPriority16ThreadHandle(NtSetInformationThreadFn setThread, HANDLE
     error = ERROR_SUCCESS;
 
     ULONG disableBoost = TRUE;
-    const NTSTATUS_T status = setThread(thread, ThreadPriorityBoost, &disableBoost, sizeof(disableBoost));
+    const NTSTATUS_T status = setThread(thread, kThreadPriorityBoost, &disableBoost, sizeof(disableBoost));
     if (status < 0) {
         error = ERROR_ACCESS_DENIED;
         return false;
@@ -335,22 +360,22 @@ static bool FixPriority16ThreadHandle(NtSetInformationThreadFn setThread, HANDLE
 static NTSTATUS_T TryOpenPriorityThread(NtOpenThreadFn openThread,
                                         DWORD processId,
                                         DWORD threadId,
-                                        ACCESS_MASK access,
+                                        ACCESS_MASK desiredAccess,
                                         bool includeProcessId,
                                         HANDLE& thread) noexcept {
     thread = nullptr;
-    OBJECT_ATTRIBUTES_T attributes{sizeof(attributes), nullptr, nullptr, 0, nullptr, nullptr};
-    CLIENT_ID_T clientId{includeProcessId ? reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(processId)) : nullptr,
+    NativeObjectAttributes attributes{sizeof(attributes), nullptr, nullptr, 0, nullptr, nullptr};
+    NativeClientId clientId{includeProcessId ? reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(processId)) : nullptr,
                          reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(threadId))};
-    return openThread(&thread, access, &attributes, &clientId);
+    return openThread(&thread, desiredAccess, &attributes, &clientId);
 }
 
 static uint8_t ClassifyOpenStatus(NTSTATUS_T status) noexcept {
-    if (status == STATUS_INVALID_CID || status == STATUS_INVALID_PARAMETER) {
+    if (status == kStatusInvalidCid || status == kStatusInvalidParameter) {
         return kOpenFailureTransient;
     }
 
-    if (status == STATUS_ACCESS_DENIED) {
+    if (status == kStatusAccessDenied) {
         return kOpenFailureProtected;
     }
 
@@ -370,14 +395,15 @@ static bool OpenPriorityFixThread(NtOpenThreadFn openThread,
         THREAD_ALL_ACCESS
     };
 
-    NTSTATUS_T lastStatus = STATUS_ACCESS_DENIED;
-    for (const ACCESS_MASK access : accessMasks) {
-        lastStatus = TryOpenPriorityThread(openThread, processId, threadId, access, true, thread);
+    NTSTATUS_T lastStatus = kStatusAccessDenied;
+    for (size_t i = 0; i < sizeof(accessMasks) / sizeof(accessMasks[0]); ++i) {
+        const ACCESS_MASK desiredAccess = accessMasks[i];
+        lastStatus = TryOpenPriorityThread(openThread, processId, threadId, desiredAccess, true, thread);
         if (lastStatus >= 0 && thread != nullptr) {
             return true;
         }
 
-        lastStatus = TryOpenPriorityThread(openThread, processId, threadId, access, false, thread);
+        lastStatus = TryOpenPriorityThread(openThread, processId, threadId, desiredAccess, false, thread);
         if (lastStatus >= 0 && thread != nullptr) {
             return true;
         }
@@ -406,11 +432,11 @@ static bool FixPriority16Thread(NtOpenThreadFn openThread,
     return ok;
 }
 
-static HANDLE OpenProcessNative(NtOpenProcessFn openProcess, DWORD processId, ACCESS_MASK access) noexcept {
+static HANDLE OpenProcessNative(NtOpenProcessFn openProcess, DWORD processId, ACCESS_MASK desiredAccess) noexcept {
     HANDLE process = nullptr;
-    OBJECT_ATTRIBUTES_T attributes{sizeof(attributes), nullptr, nullptr, 0, nullptr, nullptr};
-    CLIENT_ID_T clientId{reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(processId)), nullptr};
-    if (openProcess(&process, access, &attributes, &clientId) < 0) {
+    NativeObjectAttributes attributes{sizeof(attributes), nullptr, nullptr, 0, nullptr, nullptr};
+    NativeClientId clientId{reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(processId)), nullptr};
+    if (openProcess(&process, desiredAccess, &attributes, &clientId) < 0) {
         return nullptr;
     }
 
@@ -431,7 +457,7 @@ static void DisableProcessPriorityBoost(NtOpenProcessFn openProcess,
     }
 
     ULONG disableBoost = TRUE;
-    setProcess(process, ProcessPriorityBoost, &disableBoost, sizeof(disableBoost));
+    setProcess(process, kProcessPriorityBoost, &disableBoost, sizeof(disableBoost));
     closeHandle(process);
 }
 
@@ -498,11 +524,11 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
     }
 
     const DWORD currentThreadId = GetCurrentThreadId();
-    auto* process = reinterpret_cast<SYSTEM_PROCESS_INFORMATION_T*>(buffer);
+    auto* process = reinterpret_cast<NativeSystemProcessInformation*>(buffer);
 
     for (;;) {
         const ULONG threadCount = process->NumberOfThreads;
-        const SYSTEM_THREAD_INFORMATION_T* thread = process->Threads;
+        const NativeSystemThreadInformation* thread = process->Threads;
 
         for (ULONG i = 0; i < threadCount; ++i, ++thread) {
             if (thread->Priority != kTargetPriority && thread->BasePriority != kTargetPriority) {
@@ -547,7 +573,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
             break;
         }
 
-        process = reinterpret_cast<SYSTEM_PROCESS_INFORMATION_T*>(
+        process = reinterpret_cast<NativeSystemProcessInformation*>(
             reinterpret_cast<BYTE*>(process) + process->NextEntryOffset);
     }
 
@@ -598,8 +624,8 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
             }
 
             previousThread = thread;
-            THREAD_BASIC_INFORMATION_T basic{};
-            if (queryThread(thread, ThreadBasicInformation, &basic, sizeof(basic), nullptr) < 0) {
+            NativeThreadBasicInformation basic{};
+            if (queryThread(thread, kThreadBasicInformation, &basic, sizeof(basic), nullptr) < 0) {
                 continue;
             }
 
