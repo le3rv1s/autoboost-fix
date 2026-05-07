@@ -108,7 +108,8 @@ struct SYSTEM_PROCESS_INFORMATION_T {
 
 using RtlAllocateHeapFn = PVOID(NTAPI*)(PVOID, ULONG, SIZE_T);
 using RtlFreeHeapFn = BOOLEAN(NTAPI*)(PVOID, ULONG, PVOID);
-using RtlGetProcessHeapFn = PVOID(NTAPI*)();
+using RtlCreateHeapFn = PVOID(NTAPI*)(ULONG, PVOID, SIZE_T, SIZE_T, PVOID, PVOID);
+using RtlDestroyHeapFn = PVOID(NTAPI*)(PVOID);
 using NtOpenProcessTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, ACCESS_MASK, PHANDLE);
 using NtAdjustPrivilegesTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, BOOLEAN, PTOKEN_PRIVILEGES, ULONG, PTOKEN_PRIVILEGES, PULONG);
 using NtQueryInformationTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -566,7 +567,8 @@ int wmain(int argc, wchar_t** argv) {
 
     const auto allocateHeap = reinterpret_cast<RtlAllocateHeapFn>(GetProcAddress(ntdll, "RtlAllocateHeap"));
     const auto freeHeap = reinterpret_cast<RtlFreeHeapFn>(GetProcAddress(ntdll, "RtlFreeHeap"));
-    const auto getProcessHeap = reinterpret_cast<RtlGetProcessHeapFn>(GetProcAddress(ntdll, "RtlGetProcessHeap"));
+    const auto createHeap = reinterpret_cast<RtlCreateHeapFn>(GetProcAddress(ntdll, "RtlCreateHeap"));
+    const auto destroyHeap = reinterpret_cast<RtlDestroyHeapFn>(GetProcAddress(ntdll, "RtlDestroyHeap"));
     const auto openProcessToken = reinterpret_cast<NtOpenProcessTokenFn>(
         GetProcAddress(ntdll, "NtOpenProcessToken"));
     const auto queryToken = reinterpret_cast<NtQueryInformationTokenFn>(
@@ -578,16 +580,17 @@ int wmain(int argc, wchar_t** argv) {
         GetProcAddress(ntdll, "NtSetInformationProcess"));
     const auto closeHandle = reinterpret_cast<NtCloseFn>(GetProcAddress(ntdll, "NtClose"));
     const auto delayExecution = reinterpret_cast<NtDelayExecutionFn>(GetProcAddress(ntdll, "NtDelayExecution"));
-    if (allocateHeap == nullptr || freeHeap == nullptr || getProcessHeap == nullptr || openProcessToken == nullptr ||
+    if (allocateHeap == nullptr || freeHeap == nullptr || createHeap == nullptr || destroyHeap == nullptr ||
+        openProcessToken == nullptr ||
         queryToken == nullptr || adjustToken == nullptr || openProcess == nullptr || setProcess == nullptr ||
         closeHandle == nullptr || delayExecution == nullptr) {
         std::fputs("required ntdll memory APIs are unavailable\n", stderr);
         return 1;
     }
 
-    PVOID heap = getProcessHeap();
+    PVOID heap = createHeap(0, nullptr, 0, 0, nullptr, nullptr);
     if (heap == nullptr) {
-        std::fputs("RtlGetProcessHeap failed\n", stderr);
+        std::fputs("RtlCreateHeap failed\n", stderr);
         return 1;
     }
 
@@ -611,6 +614,7 @@ int wmain(int argc, wchar_t** argv) {
     PVOID buffer = allocateHeap(heap, 0, capacity);
     if (buffer == nullptr) {
         std::fputs("failed to allocate snapshot buffer\n", stderr);
+        destroyHeap(heap);
         return 1;
     }
     ThreadCache threadCache{};
@@ -647,5 +651,6 @@ int wmain(int argc, wchar_t** argv) {
     } while (true);
 
     freeHeap(heap, 0, buffer);
+    destroyHeap(heap);
     return 0;
 }
