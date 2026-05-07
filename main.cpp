@@ -7,6 +7,14 @@
 #include <cstdlib>
 #include <memory>
 
+#ifndef THREAD_QUERY_LIMITED_INFORMATION
+#define THREAD_QUERY_LIMITED_INFORMATION 0x0800
+#endif
+
+#ifndef THREAD_SET_LIMITED_INFORMATION
+#define THREAD_SET_LIMITED_INFORMATION 0x0400
+#endif
+
 using NTSTATUS_T = LONG;
 using KPRIORITY = LONG;
 
@@ -20,7 +28,7 @@ constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH = static_cast<NTSTATUS_T>(0xC00
 constexpr ULONG SystemProcessInformation = 5;
 constexpr KPRIORITY kTargetPriority = 16;
 constexpr uint32_t kDefaultIntervalMs = 1000;
-constexpr uint32_t kGlobalRefreshScans = 30;
+constexpr uint32_t kGlobalRefreshScans = 60;
 constexpr uint32_t kRetryCooldownScans = 256;
 constexpr size_t kThreadCacheSize = 512;
 constexpr size_t kProcessCacheSize = 64;
@@ -28,6 +36,8 @@ constexpr uint8_t kCacheEmpty = 0;
 constexpr uint8_t kCacheFixed = 1;
 constexpr uint8_t kCacheDenied = 2;
 constexpr uint8_t kCacheFailed = 3;
+constexpr ACCESS_MASK kThreadFixAccess = THREAD_SET_LIMITED_INFORMATION;
+constexpr ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION;
 
 struct CLIENT_ID_T {
     HANDLE UniqueProcess;
@@ -88,6 +98,7 @@ struct SYSTEM_PROCESS_INFORMATION_T {
 
 using NtQuerySystemInformationFn = NTSTATUS_T(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
 using NtQueryInformationThreadFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+using NtSetInformationThreadFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
 using NtGetNextThreadFn = NTSTATUS_T(NTAPI*)(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
 
 struct THREAD_BASIC_INFORMATION_T {
@@ -100,6 +111,7 @@ struct THREAD_BASIC_INFORMATION_T {
 };
 
 constexpr ULONG ThreadBasicInformation = 0;
+constexpr ULONG ThreadPriorityBoost = 14;
 
 struct ScanStats {
     uint32_t seenPriority16 = 0;
@@ -228,8 +240,15 @@ static bool QueryProcessSnapshot(NtQuerySystemInformationFn query,
     return status >= 0;
 }
 
-static bool FixPriority16ThreadHandle(HANDLE thread, DWORD& error) noexcept {
+static bool FixPriority16ThreadHandle(NtSetInformationThreadFn setThread, HANDLE thread, DWORD& error) noexcept {
     error = ERROR_SUCCESS;
+
+    ULONG disableBoost = TRUE;
+    if (setThread != nullptr &&
+        setThread(thread, ThreadPriorityBoost, &disableBoost, sizeof(disableBoost)) >= 0) {
+        return true;
+    }
+
     const BOOL ok = SetThreadPriorityBoost(thread, TRUE);
     if (ok == FALSE) {
         error = GetLastError();
@@ -238,15 +257,15 @@ static bool FixPriority16ThreadHandle(HANDLE thread, DWORD& error) noexcept {
     return ok != FALSE;
 }
 
-static bool FixPriority16Thread(DWORD threadId, DWORD& error) noexcept {
+static bool FixPriority16Thread(NtSetInformationThreadFn setThread, DWORD threadId, DWORD& error) noexcept {
     error = ERROR_SUCCESS;
-    HANDLE thread = OpenThread(THREAD_SET_INFORMATION, FALSE, threadId);
+    HANDLE thread = OpenThread(kThreadFixAccess, FALSE, threadId);
     if (thread == nullptr) {
         error = GetLastError();
         return false;
     }
 
-    const bool ok = FixPriority16ThreadHandle(thread, error);
+    const bool ok = FixPriority16ThreadHandle(setThread, thread, error);
     CloseHandle(thread);
     return ok;
 }
@@ -302,6 +321,7 @@ static void RememberProcess(ProcessCache& cache, DWORD processId, uint32_t scanI
 }
 
 static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
+                                       NtSetInformationThreadFn setThread,
                                        std::unique_ptr<BYTE[]>& buffer,
                                        ULONG& capacity,
                                        ThreadCache& threadCache,
@@ -338,7 +358,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
             }
 
             DWORD error = ERROR_SUCCESS;
-            if (FixPriority16Thread(threadId, error)) {
+            if (FixPriority16Thread(setThread, threadId, error)) {
                 ++stats.fixedPriority16;
                 RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
             } else if (error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_PARAMETER) {
@@ -363,6 +383,7 @@ static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
 
 static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
                                              NtQueryInformationThreadFn queryThread,
+                                             NtSetInformationThreadFn setThread,
                                              ThreadCache& threadCache,
                                              ProcessCache& processCache,
                                              uint32_t scanId) noexcept {
@@ -388,7 +409,7 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
             HANDLE thread = nullptr;
             const NTSTATUS_T status = getNextThread(processEntry.process,
                                                     previousThread,
-                                                    THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION,
+                                                    kThreadQueryFixAccess,
                                                     0,
                                                     0,
                                                     &thread);
@@ -423,7 +444,7 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
             }
 
             DWORD error = ERROR_SUCCESS;
-            if (FixPriority16ThreadHandle(thread, error)) {
+            if (FixPriority16ThreadHandle(setThread, thread, error)) {
                 ++stats.fixedPriority16;
                 RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
             } else if (error == ERROR_ACCESS_DENIED || error == ERROR_INVALID_PARAMETER) {
@@ -452,9 +473,11 @@ int wmain(int argc, wchar_t** argv) {
         GetProcAddress(ntdll, "NtQuerySystemInformation"));
     const auto queryThread = reinterpret_cast<NtQueryInformationThreadFn>(
         GetProcAddress(ntdll, "NtQueryInformationThread"));
+    const auto setThread = reinterpret_cast<NtSetInformationThreadFn>(
+        GetProcAddress(ntdll, "NtSetInformationThread"));
     const auto getNextThread = reinterpret_cast<NtGetNextThreadFn>(
         GetProcAddress(ntdll, "NtGetNextThread"));
-    if (query == nullptr || queryThread == nullptr || getNextThread == nullptr) {
+    if (query == nullptr || queryThread == nullptr || setThread == nullptr || getNextThread == nullptr) {
         std::fputs("required ntdll thread query APIs are unavailable\n", stderr);
         return 1;
     }
@@ -474,8 +497,8 @@ int wmain(int argc, wchar_t** argv) {
     do {
         const bool globalRefresh = intervalMs == 0 || scanId == 1 || (scanId % kGlobalRefreshScans) == 0;
         const ScanStats stats = globalRefresh
-            ? ScanAndFixPriority16(query, buffer, capacity, threadCache, processCache, scanId++)
-            : ScanCachedPriority16Processes(getNextThread, queryThread, threadCache, processCache, scanId++);
+            ? ScanAndFixPriority16(query, setThread, buffer, capacity, threadCache, processCache, scanId++)
+            : ScanCachedPriority16Processes(getNextThread, queryThread, setThread, threadCache, processCache, scanId++);
         if (intervalMs == 0 || stats.fixedPriority16 != 0 || stats.openFailures != 0 || stats.fixFailures != 0) {
             std::printf("priority16_seen=%u priority16_fixed=%u cached_skipped=%u open_failures=%u fix_failures=%u\n",
                         stats.seenPriority16,
