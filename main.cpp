@@ -575,6 +575,15 @@ static ScanStats FastForegroundCheck(NtOpenProcessFn openProcess,
 }
 
 int wmain(int argc, wchar_t** argv) {
+    const HWND consoleWindow = GetConsoleWindow();
+    if (consoleWindow != nullptr) {
+        ShowWindow(consoleWindow, SW_HIDE);
+        FreeConsole();
+    }
+
+    SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+
     const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (ntdll == nullptr) {
         return 1;
@@ -630,11 +639,6 @@ int wmain(int argc, wchar_t** argv) {
     const uint32_t intervalMs = ReadIntervalMs(argc, argv);
     const uint32_t scansPerFullRefresh = intervalMs == 0 ? 1 : (kFullRefreshMs / intervalMs == 0 ? 1 : kFullRefreshMs / intervalMs);
 
-    std::printf("interval=%u ms, full refresh cadence=%u scans (~120s), incremental budget=%zu processes/scan\n",
-        intervalMs,
-        scansPerFullRefresh,
-        kProcessIncrementalBudget);
-
     do {
         const bool doFullRefresh = (intervalMs == 0) || (scanId == 1) || ((scanId % scansPerFullRefresh) == 0);
         if (!doFullRefresh) {
@@ -661,18 +665,6 @@ int wmain(int argc, wchar_t** argv) {
             merged.protectedFailures += foregroundStats.protectedFailures;
             merged.transientFailures += foregroundStats.transientFailures;
             merged.fixFailures += foregroundStats.fixFailures;
-        }
-
-        if (intervalMs == 0 || merged.fixedPriority16 != 0 || merged.openFailures != 0 || merged.fixFailures != 0) {
-            std::printf("full=%u seen=%u fixed=%u skipped=%u open_fail=%u protected=%u transient=%u fix_fail=%u\n",
-                doFullRefresh ? 1u : 0u,
-                merged.seenPriority16,
-                merged.fixedPriority16,
-                merged.cachedSkipped,
-                merged.openFailures,
-                merged.protectedFailures,
-                merged.transientFailures,
-                merged.fixFailures);
         }
 
         if (intervalMs == 0) {
