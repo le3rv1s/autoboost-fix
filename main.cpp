@@ -65,15 +65,15 @@ constexpr ULONG kSystemProcessInformation = 5;
 constexpr KPRIORITY kTargetPriority = 16;
 constexpr ULONG kHeapGrowable = 0x00000002;
 constexpr uint32_t kDefaultIntervalMs = 1000;
-constexpr uint32_t kGlobalRefreshScans = 8;
+constexpr uint32_t kGlobalRefreshScans = 2;
 constexpr uint32_t kRetryCooldownScans = 8192;
 constexpr uint32_t kRetryCooldownFixedScans = 2;
-constexpr uint32_t kCachedRefreshStride = 1;
+constexpr uint32_t kCachedRefreshStride = 0;
 constexpr uint32_t kCachedProcessRescanScans = 1;
 constexpr size_t kThreadCacheSize = 1024;
 constexpr size_t kProcessCacheSize = 128;
-constexpr size_t kCachedThreadsPerProcessPerScan = 4;
-constexpr size_t kCachedThreadFixBudgetPerScan = 128;
+constexpr size_t kCachedThreadsPerProcessPerScan = 1;
+constexpr size_t kCachedThreadFixBudgetPerScan = 8;
 constexpr uint32_t kProcessCacheMaxStaleScans = 64;
 constexpr uint8_t kCacheEmpty = 0;
 constexpr uint8_t kCacheFixed = 1;
@@ -875,7 +875,7 @@ int wmain(int argc, wchar_t** argv) {
 
     do {
         const bool globalRefresh = intervalMs == 0 || scanId == 1 || (scanId % kGlobalRefreshScans) == 0;
-        const bool cachedRefresh = !globalRefresh && (scanId % kCachedRefreshStride) == 0;
+        const bool cachedRefresh = !globalRefresh && kCachedRefreshStride != 0 && (scanId % kCachedRefreshStride) == 0;
         const ScanStats stats = globalRefresh
             ? ScanAndFixPriority16(query,
                 allocateHeap,
