@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <tlhelp32.h>
 
 using NTSTATUS_T = LONG;
 using KPRIORITY = LONG;
@@ -129,9 +128,7 @@ constexpr uint32_t kRetryCooldownFixedScans = 1;
 constexpr size_t kThreadCacheSize = 1024;
 
 constexpr size_t kProcessCacheSize = 192;
-constexpr size_t kProcessIncrementalBudget = 3;
-
-constexpr uint32_t kLightProcessRefreshScans = 5;
+constexpr size_t kProcessIncrementalBudget = 1;
 
 struct ScanStats {
     uint32_t seenPriority16 = 0;
@@ -383,27 +380,6 @@ static void SeedActiveProcessesLight(ProcessCache& processCache, uint32_t scanId
         }
     }
 
-    const DWORD dwmPid = GetProcessId(GetShellWindow());
-    if (dwmPid != 0) {
-        RememberProcess(processCache, dwmPid, scanId);
-    }
-}
-
-static void SeedProcessCacheFromPidSnapshot(ProcessCache& processCache, uint32_t scanId) noexcept {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    PROCESSENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            RememberProcess(processCache, entry.th32ProcessID, scanId);
-        } while (Process32NextW(snapshot, &entry));
-    }
-
-    CloseHandle(snapshot);
 }
 
 static ScanStats FullRefreshAndSeedProcesses(NtQuerySystemInformationFn query,
@@ -634,9 +610,6 @@ int wmain(int argc, wchar_t** argv) {
         const bool doFullRefresh = (intervalMs == 0) || (scanId == 1) || ((scanId % scansPerFullRefresh) == 0);
         if (!doFullRefresh) {
             SeedActiveProcessesLight(processCache, scanId);
-            if ((scanId % kLightProcessRefreshScans) == 0) {
-                SeedProcessCacheFromPidSnapshot(processCache, scanId);
-            }
         }
 
         const ScanStats stats = doFullRefresh
