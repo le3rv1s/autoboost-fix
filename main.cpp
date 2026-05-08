@@ -469,15 +469,14 @@ static ScanStats IncrementalProcessCheck(NtOpenProcessFn openProcess,
     ScanStats stats{};
     const DWORD currentThreadId = GetCurrentThreadId();
 
-    for (size_t budget = 0; budget < kProcessIncrementalBudget; ++budget) {
-        ProcessCacheEntry& processEntry = processCache.entries[(processCache.cursor + budget) % kProcessCacheSize];
-        if (processEntry.processId == 0) {
-            continue;
+    auto scanOneProcess = [&](DWORD processId) {
+        if (processId == 0) {
+            return;
         }
 
-        HANDLE process = OpenProcessForThreadWalk(openProcess, processEntry.processId);
+        HANDLE process = OpenProcessForThreadWalk(openProcess, processId);
         if (process == nullptr) {
-            continue;
+            return;
         }
 
         HANDLE previousThread = nullptr;
@@ -514,7 +513,7 @@ static ScanStats IncrementalProcessCheck(NtOpenProcessFn openProcess,
             }
 
             ++stats.seenPriority16;
-            if (ShouldSkipCachedThread(threadCache, processEntry.processId, threadId, scanId)) {
+            if (ShouldSkipCachedThread(threadCache, processId, threadId, scanId)) {
                 ++stats.cachedSkipped;
                 continue;
             }
@@ -523,15 +522,15 @@ static ScanStats IncrementalProcessCheck(NtOpenProcessFn openProcess,
             const NTSTATUS_T setStatus = setThread(thread, kThreadBasePriority, &normalPriority, sizeof(normalPriority));
             if (setStatus >= 0) {
                 ++stats.fixedPriority16;
-                RememberThread(threadCache, processEntry.processId, threadId, scanId, 1);
+                RememberThread(threadCache, processId, threadId, scanId, 1);
             }
             else if (setStatus == kStatusAccessDenied) {
                 ++stats.openFailures;
-                RememberThread(threadCache, processEntry.processId, threadId, scanId, 2);
+                RememberThread(threadCache, processId, threadId, scanId, 2);
             }
             else {
                 ++stats.fixFailures;
-                RememberThread(threadCache, processEntry.processId, threadId, scanId, 3);
+                RememberThread(threadCache, processId, threadId, scanId, 3);
             }
         }
 
@@ -539,6 +538,11 @@ static ScanStats IncrementalProcessCheck(NtOpenProcessFn openProcess,
             closeHandle(previousThread);
         }
         closeHandle(process);
+    };
+
+    for (size_t budget = 0; budget < kProcessIncrementalBudget; ++budget) {
+        ProcessCacheEntry& processEntry = processCache.entries[(processCache.cursor + budget) % kProcessCacheSize];
+        scanOneProcess(processEntry.processId);
     }
 
     processCache.cursor = (processCache.cursor + kProcessIncrementalBudget) % kProcessCacheSize;
@@ -565,16 +569,9 @@ static ScanStats FastForegroundCheck(NtOpenProcessFn openProcess,
         return stats;
     }
 
-    ProcessCache singleProcessCache{};
-    singleProcessCache.entries[0].processId = processId;
-    return IncrementalProcessCheck(openProcess,
-        getNextThread,
-        queryThread,
-        setThread,
-        closeHandle,
-        threadCache,
-        singleProcessCache,
-        scanId);
+    ProcessCache foregroundOnly{};
+    foregroundOnly.entries[0].processId = processId;
+    return IncrementalProcessCheck(openProcess, getNextThread, queryThread, setThread, closeHandle, threadCache, foregroundOnly, scanId);
 }
 
 int wmain(int argc, wchar_t** argv) {
