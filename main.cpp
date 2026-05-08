@@ -545,6 +545,38 @@ static ScanStats IncrementalProcessCheck(NtOpenProcessFn openProcess,
     return stats;
 }
 
+static ScanStats FastForegroundCheck(NtOpenProcessFn openProcess,
+    NtGetNextThreadFn getNextThread,
+    NtQueryInformationThreadFn queryThread,
+    NtSetInformationThreadFn setThread,
+    NtCloseFn closeHandle,
+    ThreadCache& threadCache,
+    uint32_t scanId) noexcept {
+    ScanStats stats{};
+
+    DWORD processId = 0;
+    const HWND foreground = GetForegroundWindow();
+    if (foreground == nullptr) {
+        return stats;
+    }
+
+    GetWindowThreadProcessId(foreground, &processId);
+    if (processId == 0) {
+        return stats;
+    }
+
+    ProcessCache singleProcessCache{};
+    singleProcessCache.entries[0].processId = processId;
+    return IncrementalProcessCheck(openProcess,
+        getNextThread,
+        queryThread,
+        setThread,
+        closeHandle,
+        threadCache,
+        singleProcessCache,
+        scanId);
+}
+
 int wmain(int argc, wchar_t** argv) {
     const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (ntdll == nullptr) {
@@ -616,16 +648,34 @@ int wmain(int argc, wchar_t** argv) {
             ? FullRefreshAndSeedProcesses(query, reallocateHeap, heap, buffer, capacity, openThread, setThread, closeHandle, threadCache, processCache, scanId)
             : IncrementalProcessCheck(openProcess, getNextThread, queryThread, setThread, closeHandle, threadCache, processCache, scanId);
 
-        if (intervalMs == 0 || stats.fixedPriority16 != 0 || stats.openFailures != 0 || stats.fixFailures != 0) {
+        ScanStats merged = stats;
+        if (!doFullRefresh) {
+            const ScanStats foregroundStats = FastForegroundCheck(openProcess,
+                getNextThread,
+                queryThread,
+                setThread,
+                closeHandle,
+                threadCache,
+                scanId);
+            merged.seenPriority16 += foregroundStats.seenPriority16;
+            merged.fixedPriority16 += foregroundStats.fixedPriority16;
+            merged.cachedSkipped += foregroundStats.cachedSkipped;
+            merged.openFailures += foregroundStats.openFailures;
+            merged.protectedFailures += foregroundStats.protectedFailures;
+            merged.transientFailures += foregroundStats.transientFailures;
+            merged.fixFailures += foregroundStats.fixFailures;
+        }
+
+        if (intervalMs == 0 || merged.fixedPriority16 != 0 || merged.openFailures != 0 || merged.fixFailures != 0) {
             std::printf("full=%u seen=%u fixed=%u skipped=%u open_fail=%u protected=%u transient=%u fix_fail=%u\n",
                 doFullRefresh ? 1u : 0u,
-                stats.seenPriority16,
-                stats.fixedPriority16,
-                stats.cachedSkipped,
-                stats.openFailures,
-                stats.protectedFailures,
-                stats.transientFailures,
-                stats.fixFailures);
+                merged.seenPriority16,
+                merged.fixedPriority16,
+                merged.cachedSkipped,
+                merged.openFailures,
+                merged.protectedFailures,
+                merged.transientFailures,
+                merged.fixFailures);
         }
 
         if (intervalMs == 0) {
