@@ -65,15 +65,16 @@ constexpr ULONG kSystemProcessInformation = 5;
 constexpr KPRIORITY kTargetPriority = 16;
 constexpr ULONG kHeapGrowable = 0x00000002;
 constexpr uint32_t kDefaultIntervalMs = 1000;
-constexpr uint32_t kGlobalRefreshScans = 60;
+constexpr uint32_t kGlobalRefreshScans = 8;
 constexpr uint32_t kRetryCooldownScans = 8192;
 constexpr uint32_t kRetryCooldownFixedScans = 2;
 constexpr uint32_t kCachedRefreshStride = 1;
-constexpr uint32_t kCachedProcessRescanScans = 2;
-constexpr size_t kThreadCacheSize = 512;
-constexpr size_t kProcessCacheSize = 64;
-constexpr size_t kCachedProcessesPerScan = 1;
-constexpr size_t kCachedThreadsPerProcessPerScan = 2;
+constexpr uint32_t kCachedProcessRescanScans = 1;
+constexpr size_t kThreadCacheSize = 1024;
+constexpr size_t kProcessCacheSize = 128;
+constexpr size_t kCachedThreadsPerProcessPerScan = 4;
+constexpr size_t kCachedThreadFixBudgetPerScan = 128;
+constexpr uint32_t kProcessCacheMaxStaleScans = 64;
 constexpr uint8_t kCacheEmpty = 0;
 constexpr uint8_t kCacheFixed = 1;
 constexpr uint8_t kCacheDenied = 2;
@@ -577,6 +578,24 @@ static void RememberProcess(ProcessCache& cache,
     cache.entries[slot] = ProcessCacheEntry{ processId, OpenCachedProcess(openProcess, processId), scanId, 0 };
 }
 
+static void PruneStaleProcesses(ProcessCache& cache, NtCloseFn closeHandle, uint32_t scanId) noexcept {
+    for (ProcessCacheEntry& entry : cache.entries) {
+        if (entry.processId == 0) {
+            continue;
+        }
+
+        if (scanId - entry.lastSeenScan < kProcessCacheMaxStaleScans) {
+            continue;
+        }
+
+        if (entry.process != nullptr) {
+            closeHandle(entry.process);
+        }
+
+        entry = ProcessCacheEntry{};
+    }
+}
+
 static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
     RtlAllocateHeapFn allocateHeap,
     RtlReAllocateHeapFn reallocateHeap,
@@ -694,7 +713,8 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
 
     size_t visited = 0;
     size_t handled = 0;
-    while (visited < kProcessCacheSize && handled < kCachedProcessesPerScan) {
+    size_t fixedBudget = 0;
+    while (visited < kProcessCacheSize && fixedBudget < kCachedThreadFixBudgetPerScan) {
         ProcessCacheEntry& processEntry = processCache.entries[(processCursor + visited) % kProcessCacheSize];
         ++visited;
         if (processEntry.processId == 0) {
@@ -755,6 +775,7 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
 
             DWORD error = ERROR_SUCCESS;
             ++processTried;
+            ++fixedBudget;
             if (FixPriority16ThreadHandle(setThread, thread, error)) {
                 ++stats.fixedPriority16;
                 RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
@@ -768,7 +789,7 @@ static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
                 RememberThread(threadCache, processId, threadId, scanId, kCacheFailed);
             }
 
-            if (processTried >= kCachedThreadsPerProcessPerScan) {
+            if (processTried >= kCachedThreadsPerProcessPerScan || fixedBudget >= kCachedThreadFixBudgetPerScan) {
                 break;
             }
         }
@@ -848,8 +869,8 @@ int wmain(int argc, wchar_t** argv) {
     const uint32_t intervalMs = ReadIntervalMs(argc, argv);
 
     if (intervalMs != 0) {
-        std::printf("monitoring priority 16 threads every %u ms; global refresh every %u scans; cached budget=%zu process/scan; pass 0 for one scan\n",
-            intervalMs, kGlobalRefreshScans, kCachedProcessesPerScan);
+        std::printf("monitoring priority 16 threads every %u ms; global refresh every %u scans; cached thread budget=%zu/scan; pass 0 for one scan\n",
+            intervalMs, kGlobalRefreshScans, kCachedThreadFixBudgetPerScan);
     }
 
     do {
@@ -882,6 +903,10 @@ int wmain(int argc, wchar_t** argv) {
                     processCursor,
                     scanId++)
                 : ScanStats{});
+        if (globalRefresh) {
+            PruneStaleProcesses(processCache, closeHandle, scanId);
+        }
+
         if (intervalMs == 0 || stats.fixedPriority16 != 0 || stats.openFailures != 0 || stats.fixFailures != 0) {
             std::printf("priority16_seen=%u priority16_fixed=%u cached_skipped=%u open_failures=%u protected_failures=%u transient_failures=%u fix_failures=%u\n",
                 stats.seenPriority16,
