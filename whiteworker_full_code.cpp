@@ -114,7 +114,6 @@ struct Row {
     bool whiteWorker = false;
     bool confirmedByMaxNorm = false;
     bool confirmedByDutyCycle = false;
-    bool confirmedByKernelPenalty = false;
 };
 
 static std::unordered_map<DWORD, Snapshot> g_previous;
@@ -630,27 +629,12 @@ int wmain() {
             // Variant 1: quadratic cycles normalization
             const double scoreQuadratic = Clamp100((cyclesNorm * cyclesNorm) / 100.0);
 
-            // Variant 2: weighted product (geometric mean)
-            const double scoreGeoMean = Clamp100(std::cbrt(cyclesNorm * cpuNorm * userNorm));
-
-            // Variant 3: kernel-penalty using user share of total CPU time
-            double userShare = 0.0;
-            const ULONGLONG totalTimeDelta = t.cpuDelta;
-            if (totalTimeDelta > 0 && t.userDelta <= totalTimeDelta) {
-                userShare = (double)t.userDelta / (double)totalTimeDelta;
-            }
-            const double scoreKernelPenalty = Clamp100(cyclesNorm * userShare);
-
             const bool byQuadratic = scoreQuadratic >= WHITE_THRESHOLD;
-            const bool byGeoMean = scoreGeoMean >= WHITE_THRESHOLD;
-            const bool byKernelPenalty = scoreKernelPenalty >= WHITE_THRESHOLD;
 
-            r.whiteWorker = byQuadratic || byGeoMean || byKernelPenalty;
+            r.whiteWorker = byQuadratic;
             r.confirmedByMaxNorm = byQuadratic;
-            r.confirmedByDutyCycle = byGeoMean;
-
-            r.confirmedByKernelPenalty = byKernelPenalty;
-            r.score = Clamp100(std::max(scoreQuadratic, std::max(scoreGeoMean, scoreKernelPenalty)));
+            r.confirmedByDutyCycle = false;
+            r.score = scoreQuadratic;
 
             rows.push_back(std::move(r));
         }
@@ -696,14 +680,7 @@ int wmain() {
                 << L" WhiteWorker="
                 << (r.whiteWorker ? L"YES" : L"NO")
                 << L" ConfirmedBy="
-                << (r.whiteWorker
-                    ? (r.confirmedByMaxNorm && r.confirmedByDutyCycle && r.confirmedByKernelPenalty ? L"QUADRATIC|GEOMEAN|KERNEL_PENALTY"
-                       : (r.confirmedByMaxNorm && r.confirmedByDutyCycle ? L"QUADRATIC|GEOMEAN"
-                          : (r.confirmedByMaxNorm && r.confirmedByKernelPenalty ? L"QUADRATIC|KERNEL_PENALTY"
-                             : (r.confirmedByDutyCycle && r.confirmedByKernelPenalty ? L"GEOMEAN|KERNEL_PENALTY"
-                                : (r.confirmedByMaxNorm ? L"QUADRATIC"
-                                   : (r.confirmedByDutyCycle ? L"GEOMEAN" : L"KERNEL_PENALTY"))))))
-                    : L"-" )
+                << (r.whiteWorker ? L"QUADRATIC" : L"-")
 
                 << L"\n";
         }
