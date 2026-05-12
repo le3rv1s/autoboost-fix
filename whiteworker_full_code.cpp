@@ -580,7 +580,7 @@ int wmain() {
 
         std::vector<Row> rows;
 
-        // Single formula:
+        // Variant 1:
         // x = Delta_thread / MaxDelta_process (same tick)
         ULONGLONG maxCyclesDelta = 0;
         for (const auto& t : tempRows) {
@@ -589,6 +589,9 @@ int wmain() {
             }
         }
 
+        // Variant 2 (from screenshot, simplified):
+        // Score = 100 * sqrt(Cycles / MaxCycles)
+        // (second UserTime part removed as requested)
         for (auto& t : tempRows) {
             Row r{};
 
@@ -606,11 +609,20 @@ int wmain() {
                 (maxCyclesDelta > 0)
                 ? ((double)t.cycles / (double)maxCyclesDelta)
                 : 0.0;
+            const double scoreMaxDelta = Clamp100(x * 100.0);
 
-            r.score = Clamp100(x * 100.0);
-            r.whiteWorker = (r.score >= WHITE_THRESHOLD);
-            r.confirmedByMaxNorm = r.whiteWorker;
-            r.confirmedByDutyCycle = false;
+            const double scoreSqrtCycles =
+                (maxCyclesDelta > 0)
+                ? Clamp100(100.0 * std::sqrt((double)t.cycles / (double)maxCyclesDelta))
+                : 0.0;
+
+            const bool byMaxDelta = (scoreMaxDelta >= WHITE_THRESHOLD);
+            const bool bySqrtCycles = (scoreSqrtCycles >= WHITE_THRESHOLD);
+
+            r.whiteWorker = byMaxDelta || bySqrtCycles;
+            r.confirmedByMaxNorm = byMaxDelta;
+            r.confirmedByDutyCycle = bySqrtCycles;
+            r.score = Clamp100(std::max(scoreMaxDelta, scoreSqrtCycles));
 
             rows.push_back(std::move(r));
         }
@@ -656,7 +668,7 @@ int wmain() {
                 << L" WhiteWorker="
                 << (r.whiteWorker ? L"YES" : L"NO")
                 << L" ConfirmedBy="
-                << (r.whiteWorker ? L"MAX_DELTA" : L"-")
+                << (r.whiteWorker ? (r.confirmedByMaxNorm && r.confirmedByDutyCycle ? L"MAX_DELTA|SQRT_CYCLES" : (r.confirmedByMaxNorm ? L"MAX_DELTA" : L"SQRT_CYCLES")) : L"-")
 
                 << L"\n";
         }
