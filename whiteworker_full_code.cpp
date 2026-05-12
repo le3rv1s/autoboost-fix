@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <tuple>
 
 #pragma comment(lib, "Shell32.lib")
 
@@ -573,9 +574,20 @@ int wmain() {
 
         std::vector<Row> rows;
 
-        double maxCpuRel = 0.0;
-        double maxUserRel = 0.0;
-        double maxCyclesRel = 0.0;
+        // Rank-based formula:
+        // threshold is a lower bound for выдача (selection), where 100 = best rank.
+        // This is more stable for worker naming patterns (WhiteWorker/BlackWorker indexes).
+        std::unordered_map<DWORD, size_t> cpuRank;
+        std::unordered_map<DWORD, size_t> userRank;
+        std::unordered_map<DWORD, size_t> cyclesRank;
+
+        std::vector<std::pair<DWORD, double>> cpuOrder;
+        std::vector<std::pair<DWORD, double>> userOrder;
+        std::vector<std::pair<DWORD, double>> cyclesOrder;
+
+        cpuOrder.reserve(tempRows.size());
+        userOrder.reserve(tempRows.size());
+        cyclesOrder.reserve(tempRows.size());
 
         for (const auto& t : tempRows) {
             const double cyclesRel =
@@ -583,10 +595,27 @@ int wmain() {
                 ? Clamp100((double)t.cycles / (double)totalCycles * 100.0)
                 : 0.0;
 
-            maxCpuRel = std::max(maxCpuRel, t.cpuRel);
-            maxUserRel = std::max(maxUserRel, t.userRel);
-            maxCyclesRel = std::max(maxCyclesRel, cyclesRel);
+            cpuOrder.push_back({ t.tid, t.cpuRel });
+            userOrder.push_back({ t.tid, t.userRel });
+            cyclesOrder.push_back({ t.tid, cyclesRel });
         }
+
+        auto rankDesc = [](auto& v) {
+            std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+                if (a.second != b.second) return a.second > b.second;
+                return a.first < b.first;
+            });
+        };
+
+        rankDesc(cpuOrder);
+        rankDesc(userOrder);
+        rankDesc(cyclesOrder);
+
+        for (size_t i = 0; i < cpuOrder.size(); ++i) cpuRank[cpuOrder[i].first] = i;
+        for (size_t i = 0; i < userOrder.size(); ++i) userRank[userOrder[i].first] = i;
+        for (size_t i = 0; i < cyclesOrder.size(); ++i) cyclesRank[cyclesOrder[i].first] = i;
+
+        const double denom = (tempRows.size() > 1) ? (double)(tempRows.size() - 1) : 1.0;
 
         for (auto& t : tempRows) {
             Row r{};
@@ -607,20 +636,15 @@ int wmain() {
                     );
             }
 
-            const double cpuNorm =
-                (maxCpuRel > 0.0) ? (r.cpuRel / maxCpuRel * 100.0) : 0.0;
+            const double cpuRankScore = 100.0 * (1.0 - (double)cpuRank[r.tid] / denom);
+            const double userRankScore = 100.0 * (1.0 - (double)userRank[r.tid] / denom);
+            const double cyclesRankScore = 100.0 * (1.0 - (double)cyclesRank[r.tid] / denom);
 
-            const double userNorm =
-                (maxUserRel > 0.0) ? (r.userRel / maxUserRel * 100.0) : 0.0;
+            // Weighted rank score (stable with worker index ordering behavior)
+            // cycles is strongest signal, cpu second, user third.
+            r.score = Clamp100(cyclesRankScore * 0.50 + cpuRankScore * 0.30 + userRankScore * 0.20);
 
-            const double cyclesNorm =
-                (maxCyclesRel > 0.0) ? (r.cyclesRel / maxCyclesRel * 100.0) : 0.0;
-
-            r.score =
-                Clamp100((cpuNorm + userNorm + cyclesNorm) / 3.0);
-
-            r.whiteWorker =
-                (r.score >= WHITE_THRESHOLD);
+            r.whiteWorker = (r.score >= WHITE_THRESHOLD);
 
             rows.push_back(std::move(r));
         }
