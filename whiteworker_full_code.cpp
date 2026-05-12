@@ -114,6 +114,7 @@ struct Row {
     bool whiteWorker = false;
     bool confirmedByMaxNorm = false;
     bool confirmedByDutyCycle = false;
+    bool confirmedByKernelPenalty = false;
 };
 
 static std::unordered_map<DWORD, Snapshot> g_previous;
@@ -480,6 +481,8 @@ int wmain() {
             double userRel = 0.0;
 
             ULONGLONG cycles = 0;
+            ULONGLONG cpuDelta = 0;
+            ULONGLONG userDelta = 0;
 
             std::wstring name;
             std::wstring module;
@@ -562,6 +565,8 @@ int wmain() {
                 cpuRel,
                 userRel,
                 cyclesNow,
+                cpuDelta,
+                userDelta,
                 SafeText(GetThreadNameCached(tid)),
                 SafeText(
                     GetModuleFromAddress(
@@ -576,12 +581,21 @@ int wmain() {
 
         std::vector<Row> rows;
 
-        // Variant 1 (Max-Norm by cycles delta):
-        // Score = (cyclesDelta_thread / cyclesDelta_max_thread) * 100
+        // Variant 1: Quadratic normalization
+        // Score = ((Cycles_tid / Cycles_max)^2) * 100
         ULONGLONG maxCyclesDelta = 0;
+        double maxCpuRel = 0.0;
+        double maxUserRel = 0.0;
+
         for (const auto& t : tempRows) {
             if (t.cycles > maxCyclesDelta) {
                 maxCyclesDelta = t.cycles;
+            }
+            if (t.cpuRel > maxCpuRel) {
+                maxCpuRel = t.cpuRel;
+            }
+            if (t.userRel > maxUserRel) {
+                maxUserRel = t.userRel;
             }
         }
 
@@ -598,22 +612,45 @@ int wmain() {
                 r.cyclesRel = Clamp100((double)t.cycles / (double)totalCycles * 100.0);
             }
 
-            // Variant 1: Max-Norm by strongest thread cycles in current sample.
-            const double scoreMaxNorm =
+            const double cyclesNorm =
                 (maxCyclesDelta > 0)
                 ? Clamp100((double)t.cycles / (double)maxCyclesDelta * 100.0)
                 : 0.0;
 
-            // Variant 2: Duty Cycle (already represented by cpuRel based on elapsed time).
-            // cpuRel == (CPUTimeDelta_thread / ElapsedTime) * 100 clamped to [0..100].
-            const double scoreDutyCycle = Clamp100(r.cpuRel);
+            const double cpuNorm =
+                (maxCpuRel > 0.0)
+                ? Clamp100((double)t.cpuRel / maxCpuRel * 100.0)
+                : 0.0;
 
-            r.confirmedByMaxNorm = (scoreMaxNorm >= WHITE_THRESHOLD);
-            r.confirmedByDutyCycle = (scoreDutyCycle >= WHITE_THRESHOLD);
-            r.whiteWorker = r.confirmedByMaxNorm || r.confirmedByDutyCycle;
+            const double userNorm =
+                (maxUserRel > 0.0)
+                ? Clamp100((double)t.userRel / maxUserRel * 100.0)
+                : 0.0;
 
-            // Combined score for sorting only.
-            r.score = Clamp100(std::max(scoreMaxNorm, scoreDutyCycle));
+            // Variant 1: quadratic cycles normalization
+            const double scoreQuadratic = Clamp100((cyclesNorm * cyclesNorm) / 100.0);
+
+            // Variant 2: weighted product (geometric mean)
+            const double scoreGeoMean = Clamp100(std::cbrt(cyclesNorm * cpuNorm * userNorm));
+
+            // Variant 3: kernel-penalty using user share of total CPU time
+            double userShare = 0.0;
+            const ULONGLONG totalTimeDelta = t.cpuDelta;
+            if (totalTimeDelta > 0 && t.userDelta <= totalTimeDelta) {
+                userShare = (double)t.userDelta / (double)totalTimeDelta;
+            }
+            const double scoreKernelPenalty = Clamp100(cyclesNorm * userShare);
+
+            const bool byQuadratic = scoreQuadratic >= WHITE_THRESHOLD;
+            const bool byGeoMean = scoreGeoMean >= WHITE_THRESHOLD;
+            const bool byKernelPenalty = scoreKernelPenalty >= WHITE_THRESHOLD;
+
+            r.whiteWorker = byQuadratic || byGeoMean || byKernelPenalty;
+            r.confirmedByMaxNorm = byQuadratic;
+            r.confirmedByDutyCycle = byGeoMean;
+
+            r.confirmedByKernelPenalty = byKernelPenalty;
+            r.score = Clamp100(std::max(scoreQuadratic, std::max(scoreGeoMean, scoreKernelPenalty)));
 
             rows.push_back(std::move(r));
         }
@@ -660,8 +697,12 @@ int wmain() {
                 << (r.whiteWorker ? L"YES" : L"NO")
                 << L" ConfirmedBy="
                 << (r.whiteWorker
-                    ? (r.confirmedByMaxNorm && r.confirmedByDutyCycle ? L"MAX_NORM|DUTY_CYCLE"
-                       : (r.confirmedByMaxNorm ? L"MAX_NORM" : L"DUTY_CYCLE"))
+                    ? (r.confirmedByMaxNorm && r.confirmedByDutyCycle && r.confirmedByKernelPenalty ? L"QUADRATIC|GEOMEAN|KERNEL_PENALTY"
+                       : (r.confirmedByMaxNorm && r.confirmedByDutyCycle ? L"QUADRATIC|GEOMEAN"
+                          : (r.confirmedByMaxNorm && r.confirmedByKernelPenalty ? L"QUADRATIC|KERNEL_PENALTY"
+                             : (r.confirmedByDutyCycle && r.confirmedByKernelPenalty ? L"GEOMEAN|KERNEL_PENALTY"
+                                : (r.confirmedByMaxNorm ? L"QUADRATIC"
+                                   : (r.confirmedByDutyCycle ? L"GEOMEAN" : L"KERNEL_PENALTY"))))))
                     : L"-" )
 
                 << L"\n";
