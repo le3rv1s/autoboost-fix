@@ -580,29 +580,14 @@ int wmain() {
 
         std::vector<Row> rows;
 
-        // Variant 1: Top-N Mean normalization (N=5)
-        // Score = (Cycles_tid / Avg(Cycles_top5))^2 * 100
-        std::vector<ULONGLONG> cycleValues;
-        cycleValues.reserve(tempRows.size());
+        // Single formula:
+        // x = Delta_thread / MaxDelta_process (same tick)
         ULONGLONG maxCyclesDelta = 0;
-        long double totalCyclesDelta = 0.0L;
-
         for (const auto& t : tempRows) {
-            cycleValues.push_back(t.cycles);
             if (t.cycles > maxCyclesDelta) {
                 maxCyclesDelta = t.cycles;
             }
-            totalCyclesDelta += (long double)t.cycles;
         }
-
-        std::sort(cycleValues.begin(), cycleValues.end(), std::greater<ULONGLONG>());
-        const size_t topN = std::min<size_t>(5, cycleValues.size());
-        long double topSum = 0.0L;
-        for (size_t i = 0; i < topN; ++i) {
-            topSum += (long double)cycleValues[i];
-        }
-        const long double topMean = (topN > 0) ? (topSum / (long double)topN) : 0.0L;
-        const long double avgTotal = (!tempRows.empty()) ? (totalCyclesDelta / (long double)tempRows.size()) : 0.0L;
 
         for (auto& t : tempRows) {
             Row r{};
@@ -617,29 +602,15 @@ int wmain() {
                 r.cyclesRel = Clamp100((double)t.cycles / (double)totalCycles * 100.0);
             }
 
-            // Variant 1: Top-N Mean (quadratic)
-            double scoreTopNMean = 0.0;
-            if (topMean > 0.0L) {
-                const long double ratio = (long double)t.cycles / topMean;
-                scoreTopNMean = Clamp100((double)(ratio * ratio * 100.0L));
-            }
+            const double x =
+                (maxCyclesDelta > 0)
+                ? ((double)t.cycles / (double)maxCyclesDelta)
+                : 0.0;
 
-            // Variant 2: Soft-Max (quadratic)
-            // denominator = max*0.8 + avgTotal*0.2
-            const long double softDen = (long double)maxCyclesDelta * 0.8L + avgTotal * 0.2L;
-            double scoreSoftMax = 0.0;
-            if (softDen > 0.0L) {
-                const long double ratio = (long double)t.cycles / softDen;
-                scoreSoftMax = Clamp100((double)(ratio * ratio * 100.0L));
-            }
-
-            const bool byTopNMean = scoreTopNMean >= WHITE_THRESHOLD;
-            const bool bySoftMax = scoreSoftMax >= WHITE_THRESHOLD;
-
-            r.whiteWorker = byTopNMean || bySoftMax;
-            r.confirmedByMaxNorm = byTopNMean;
-            r.confirmedByDutyCycle = bySoftMax;
-            r.score = Clamp100(std::max(scoreTopNMean, scoreSoftMax));
+            r.score = Clamp100(x * 100.0);
+            r.whiteWorker = (r.score >= WHITE_THRESHOLD);
+            r.confirmedByMaxNorm = r.whiteWorker;
+            r.confirmedByDutyCycle = false;
 
             rows.push_back(std::move(r));
         }
@@ -685,7 +656,7 @@ int wmain() {
                 << L" WhiteWorker="
                 << (r.whiteWorker ? L"YES" : L"NO")
                 << L" ConfirmedBy="
-                << (r.whiteWorker ? (r.confirmedByMaxNorm && r.confirmedByDutyCycle ? L"TOPN_MEAN|SOFT_MAX" : (r.confirmedByMaxNorm ? L"TOPN_MEAN" : L"SOFT_MAX")) : L"-")
+                << (r.whiteWorker ? L"MAX_DELTA" : L"-")
 
                 << L"\n";
         }
