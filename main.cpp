@@ -152,6 +152,7 @@ struct GroupChunk {
     std::vector<size_t> members;
     ULONGLONG cyclesDeltaSum = 0;
     double share = 0.0;
+    size_t groupNo = 0;
     bool white = false;
     std::wstring label;
 };
@@ -585,8 +586,11 @@ std::vector<size_t> BuildGroupFromBucket(
     std::vector<GroupChunk>& outChunks) {
     std::vector<size_t> ordered = bucket.members;
 
-    // Stable, deterministic order: do not sort by live CPU usage, otherwise groups reshuffle randomly each sample.
+    // Prefer the hottest threads for the active group; TID is only a deterministic tie-breaker.
     std::sort(ordered.begin(), ordered.end(), [&](size_t a, size_t b) {
+        if (rows[a].cyclesDelta != rows[b].cyclesDelta) {
+            return rows[a].cyclesDelta > rows[b].cyclesDelta;
+        }
         return rows[a].tid < rows[b].tid;
     });
 
@@ -788,12 +792,12 @@ int wmain() {
             return a.members < b.members;
         });
 
-        size_t whiteGroupNo = 1;
-        size_t blackGroupNo = 1;
+        size_t groupNo = 1;
 
         for (auto& chunk : chunks) {
+            chunk.groupNo = groupNo++;
             if (chunk.white) {
-                chunk.label = L"TopGWhiteWorker/" + std::to_wstring(whiteGroupNo++);
+                chunk.label = L"TopGWhiteWorker/" + std::to_wstring(chunk.groupNo);
                 for (size_t idx : chunk.members) {
                     rows[idx].white = true;
                     rows[idx].label = chunk.label;
@@ -801,7 +805,7 @@ int wmain() {
                 }
             }
             else {
-                chunk.label = L"TopGBlackWorker/" + std::to_wstring(blackGroupNo++);
+                chunk.label = L"TopGBlackWorker/" + std::to_wstring(chunk.groupNo);
                 for (size_t idx : chunk.members) {
                     rows[idx].white = false;
                     rows[idx].label = chunk.label;
@@ -830,6 +834,7 @@ int wmain() {
         for (const auto& c : chunks) {
             log << L"  "
                 << (c.white ? L"TopGWhiteWorker" : L"TopGBlackWorker")
+                << L" GroupNo=" << c.groupNo
                 << L" Label=" << c.label
                 << L" Symbol=" << c.symbol
                 << L" Module=" << c.module
