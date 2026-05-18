@@ -130,6 +130,8 @@ struct ThreadCacheEntry {
     HANDLE handle = nullptr;
     bool symbolResolved = false;
     std::wstring originalSymbol;
+    bool originalNameResolved = false;
+    std::wstring originalName;
 };
 
 struct ThreadRow {
@@ -179,6 +181,7 @@ static std::unordered_map<DWORD, Snapshot> g_previous;
 static std::unordered_map<DWORD, ThreadCacheEntry> g_threadCache;
 static std::unordered_map<uintptr_t, std::wstring> g_moduleCache;
 static std::unordered_map<std::wstring, GroupMemory> g_groupMemory;
+static std::unordered_set<DWORD> g_previousWhiteThreads;
 
 // =========================================================
 // HELPERS
@@ -438,6 +441,53 @@ bool SetThreadName(DWORD tid, const std::wstring& newName) {
 
     HRESULT hr = g_SetThreadDescription(hThread, newName.c_str());
     return SUCCEEDED(hr);
+}
+
+bool IsManagedThreadName(const std::wstring& name) {
+    return StartsWithI(name, L"TopGWhiteWorker/") || StartsWithI(name, L"BadGroupWorker");
+}
+
+void RememberOriginalThreadName(DWORD tid) {
+    auto& entry = g_threadCache[tid];
+    if (entry.originalNameResolved) {
+        return;
+    }
+
+    entry.originalNameResolved = true;
+    entry.originalName.clear();
+
+    HANDLE hThread = GetCachedThreadHandle(tid);
+    if (!hThread || !g_GetThreadDescription) {
+        return;
+    }
+
+    PWSTR rawName = nullptr;
+    HRESULT hr = g_GetThreadDescription(hThread, &rawName);
+    if (FAILED(hr) || !rawName) {
+        return;
+    }
+
+    std::wstring currentName = rawName;
+    LocalFree(rawName);
+
+    if (!IsManagedThreadName(currentName)) {
+        entry.originalName = currentName;
+    }
+}
+
+bool SetManagedThreadName(DWORD tid, const std::wstring& newName) {
+    RememberOriginalThreadName(tid);
+    return SetThreadName(tid, newName);
+}
+
+bool RestoreOriginalThreadName(DWORD tid) {
+    RememberOriginalThreadName(tid);
+    auto it = g_threadCache.find(tid);
+    if (it == g_threadCache.end()) {
+        return SetThreadName(tid, L"");
+    }
+
+    return SetThreadName(tid, it->second.originalName);
 }
 
 ULONGLONG GetThreadCycles(DWORD tid) {
@@ -839,6 +889,7 @@ int wmain() {
         });
 
         size_t groupNo = 1;
+        std::unordered_set<DWORD> currentWhiteThreads;
 
         for (auto& chunk : chunks) {
             chunk.groupNo = groupNo++;
@@ -847,7 +898,8 @@ int wmain() {
                 for (size_t idx : chunk.members) {
                     rows[idx].white = true;
                     rows[idx].label = chunk.label;
-                    SetThreadName(rows[idx].tid, chunk.label);
+                    currentWhiteThreads.insert(rows[idx].tid);
+                    SetManagedThreadName(rows[idx].tid, chunk.label);
                 }
             }
             else if (chunk.rejected) {
@@ -855,10 +907,17 @@ int wmain() {
                 for (size_t idx : chunk.members) {
                     rows[idx].white = false;
                     rows[idx].label = chunk.label;
-                    SetThreadName(rows[idx].tid, chunk.label);
+                    SetManagedThreadName(rows[idx].tid, chunk.label);
                 }
             }
         }
+
+        for (DWORD tid : g_previousWhiteThreads) {
+            if (currentWhiteThreads.find(tid) == currentWhiteThreads.end() && seen.find(tid) != seen.end()) {
+                RestoreOriginalThreadName(tid);
+            }
+        }
+        g_previousWhiteThreads = std::move(currentWhiteThreads);
 
         for (auto it = g_previous.begin(); it != g_previous.end();) {
             if (seen.find(it->first) == seen.end()) {
