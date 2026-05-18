@@ -34,7 +34,7 @@ static constexpr ULONG SYSTEM_PROCESS_INFORMATION_CLASS = 5;
 static constexpr ULONG MEMORY_SECTION_NAME_CLASS = 2;
 static constexpr ULONG THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS = 9;
 static constexpr double TOPG_THRESHOLD = 15.0;
-static constexpr size_t MIN_THREADS_PER_GROUP = 2;
+static constexpr size_t MIN_THREADS_PER_GROUP = 3;
 static constexpr size_t MAX_THREADS_PER_GROUP = 5;
 static constexpr auto SAMPLE_INTERVAL = std::chrono::seconds(1);
 static constexpr wchar_t TARGET_GAME[] = L"SNB.exe";
@@ -809,7 +809,21 @@ int wmain() {
                 for (size_t idx : chunk.members) {
                     rows[idx].white = false;
                     rows[idx].label = chunk.label;
+                    SetThreadName(rows[idx].tid, chunk.label);
                 }
+            }
+        }
+
+        for (size_t idx : overflowMembers) {
+            rows[idx].white = false;
+            rows[idx].label = L"TopGBlackWorker/Overflow";
+            SetThreadName(rows[idx].tid, rows[idx].label);
+        }
+
+        for (auto& row : rows) {
+            if (row.label.empty()) {
+                row.label = L"TopGBlackWorker/Ungrouped";
+                SetThreadName(row.tid, row.label);
             }
         }
 
@@ -847,7 +861,7 @@ int wmain() {
         if (!overflowMembers.empty()) {
             overflowLog << L"\n[" << TimeNow() << L"] PID=" << pid << L" Process=" << processName
                 << L" OverflowThreads=" << overflowMembers.size()
-                << L" Reason=more_than_" << MAX_THREADS_PER_GROUP << L"_with_same_symbol_module\n";
+                << L" Reason=more_than_" << MAX_THREADS_PER_GROUP << L"_with_same_symbol_module_not_in_active_group\n";
             for (size_t idx : overflowMembers) {
                 const auto& r = rows[idx];
                 overflowLog << L"  TID=" << r.tid
@@ -862,7 +876,7 @@ int wmain() {
         log << L"Threads:\n";
         for (const auto& r : rows) {
             log << L"  TID=" << r.tid
-                << L" Name=" << (r.white ? r.label : r.symbol)
+                << L" Name=" << (!r.label.empty() ? r.label : r.symbol)
                 << L" Symbol=" << r.symbol
                 << L" Module=" << r.module
                 << L" CyclesDelta=" << r.cyclesDelta
