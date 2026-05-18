@@ -33,9 +33,10 @@ static constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH_VALUE = static_cast<NTST
 static constexpr ULONG SYSTEM_PROCESS_INFORMATION_CLASS = 5;
 static constexpr ULONG MEMORY_SECTION_NAME_CLASS = 2;
 static constexpr ULONG THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS = 9;
-static constexpr double TOPG_THRESHOLD = 15.0;
+static constexpr double TOPG_THRESHOLD = 20.0;
 static constexpr size_t MIN_THREADS_PER_GROUP = 3;
 static constexpr size_t MAX_THREADS_PER_GROUP = 5;
+static constexpr double MIN_GROUP_MEMBER_SHARE = TOPG_THRESHOLD / static_cast<double>(MAX_THREADS_PER_GROUP);
 static constexpr auto SAMPLE_INTERVAL = std::chrono::seconds(1);
 static constexpr wchar_t TARGET_GAME[] = L"SNB.exe";
 static constexpr size_t GROUP_MEMORY_SCANS = 50;
@@ -658,21 +659,51 @@ std::vector<size_t> BuildGroupFromBucket(
         return rows[a].tid < rows[b].tid;
     });
 
+    std::vector<size_t> notInActiveGroup;
     if (ordered.size() < MIN_THREADS_PER_GROUP) {
-        return {};
+        return notInActiveGroup;
     }
-
-    const size_t groupSize = std::min(ordered.size(), MAX_THREADS_PER_GROUP);
 
     GroupChunk chunk;
     chunk.key = bucketKey;
     chunk.symbol = bucket.symbol;
     chunk.module = bucket.module;
-    chunk.members.reserve(groupSize);
+    chunk.members.reserve(MAX_THREADS_PER_GROUP);
 
-    for (size_t i = 0; i < groupSize; ++i) {
-        chunk.members.push_back(ordered[i]);
-        chunk.cyclesDeltaSum += rows[ordered[i]].cyclesDelta;
+    bool groupClosed = false;
+    for (size_t idx : ordered) {
+        if (groupClosed) {
+            notInActiveGroup.push_back(idx);
+            continue;
+        }
+
+        // Do not let near-zero helper threads piggyback on one hot thread.
+        // With a 20% threshold and max 5 members, each selected member must contribute at least 4%.
+        if (rows[idx].cyclesShare < MIN_GROUP_MEMBER_SHARE) {
+            notInActiveGroup.push_back(idx);
+            continue;
+        }
+
+        if (chunk.members.size() >= MAX_THREADS_PER_GROUP) {
+            notInActiveGroup.push_back(idx);
+            continue;
+        }
+
+        chunk.members.push_back(idx);
+        chunk.cyclesDeltaSum += rows[idx].cyclesDelta;
+
+        if (chunk.members.size() >= MIN_THREADS_PER_GROUP && totalCyclesDelta > 0) {
+            const double currentShare = Clamp100(static_cast<double>(chunk.cyclesDeltaSum) /
+                static_cast<double>(totalCyclesDelta) * 100.0);
+            if (currentShare >= TOPG_THRESHOLD) {
+                // If 3 hot threads are enough, stop there. Do not attach extra weaker threads.
+                groupClosed = true;
+            }
+        }
+    }
+
+    if (chunk.members.size() < MIN_THREADS_PER_GROUP) {
+        return notInActiveGroup;
     }
 
     if (totalCyclesDelta > 0) {
@@ -683,11 +714,7 @@ std::vector<size_t> BuildGroupFromBucket(
     chunk.thresholdHit = chunk.share >= TOPG_THRESHOLD;
     outChunks.push_back(std::move(chunk));
 
-    if (ordered.size() <= MAX_THREADS_PER_GROUP) {
-        return {};
-    }
-
-    return std::vector<size_t>(ordered.begin() + MAX_THREADS_PER_GROUP, ordered.end());
+    return notInActiveGroup;
 }
 
 int wmain() {
@@ -940,6 +967,7 @@ int wmain() {
         for (const auto& c : chunks) {
             log << L"  "
                 << (c.white ? L"TopGWhiteWorker" : (c.rejected ? L"BadGroupWorker" : L"CandidateGroupWorker"))
+                << L" MinMemberShare=" << std::fixed << std::setprecision(2) << MIN_GROUP_MEMBER_SHARE << L"%"
                 << L" GroupNo=" << c.groupNo
                 << L" Label=" << c.label
                 << L" Symbol=" << c.symbol
@@ -955,7 +983,7 @@ int wmain() {
         if (!overflowMembers.empty()) {
             overflowLog << L"\n[" << TimeNow() << L"] PID=" << pid << L" Process=" << processName
                 << L" OverflowThreads=" << overflowMembers.size()
-                << L" Reason=more_than_" << MAX_THREADS_PER_GROUP << L"_with_same_symbol_module_not_in_active_group\n";
+                << L" Reason=not_selected_for_active_group_weak_or_extra_member\n";
             for (size_t idx : overflowMembers) {
                 const auto& r = rows[idx];
                 overflowLog << L"  TID=" << r.tid
