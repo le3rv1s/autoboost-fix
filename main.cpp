@@ -1,10 +1,40 @@
-﻿#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 
-#include <cstddef>
+#include <windows.h>
+#include <shlobj.h>
+
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
+#include <cwchar>
+#include <cwctype>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#pragma comment(lib, "Shell32.lib")
+
+using NTSTATUS_T = LONG;
+using KPRIORITY_T = LONG;
+
+using NtQuerySystemInformation_t = NTSTATUS_T(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
+using NtQueryVirtualMemory_t = NTSTATUS_T(NTAPI*)(HANDLE, PVOID, ULONG, PVOID, SIZE_T, PSIZE_T);
+using SetThreadDescription_t = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+using GetThreadDescription_t = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+
+static constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH_VALUE = static_cast<NTSTATUS_T>(0xC0000004L);
+static constexpr ULONG SYSTEM_PROCESS_INFORMATION_CLASS = 5;
+static constexpr ULONG MEMORY_SECTION_NAME_CLASS = 2;
+static constexpr double TOPG_THRESHOLD = 15.0;
+static constexpr size_t THREADS_PER_GROUP = 3;
+static constexpr auto SAMPLE_INTERVAL = std::chrono::seconds(1);
+static constexpr wchar_t TARGET_GAME[] = L"SNB.exe";
 
 #ifndef THREAD_QUERY_LIMITED_INFORMATION
 #define THREAD_QUERY_LIMITED_INFORMATION 0x0800
@@ -14,90 +44,18 @@
 #define THREAD_SET_LIMITED_INFORMATION 0x0400
 #endif
 
-#ifndef THREAD_SET_INFORMATION
-#define THREAD_SET_INFORMATION 0x0020
-#endif
-
-#ifndef THREAD_QUERY_INFORMATION
-#define THREAD_QUERY_INFORMATION 0x0040
-#endif
-
-#ifndef THREAD_ALL_ACCESS
-#define THREAD_ALL_ACCESS 0x001FFFFF
-#endif
-
-#ifdef kThreadSetAccess
-#undef kThreadSetAccess
-#endif
-#ifdef kThreadQuerySetAccess
-#undef kThreadQuerySetAccess
-#endif
-#ifdef kThreadFullQuerySetAccess
-#undef kThreadFullQuerySetAccess
-#endif
-#ifdef kProcessEnumAccess
-#undef kProcessEnumAccess
-#endif
-#ifdef kOpenFailureProtected
-#undef kOpenFailureProtected
-#endif
-#ifdef kOpenFailureTransient
-#undef kOpenFailureTransient
-#endif
-#ifdef kOpenFailureOther
-#undef kOpenFailureOther
-#endif
-
-using NTSTATUS_T = LONG;
-using KPRIORITY = LONG;
-
+// =========================================================
+// NT STRUCTS
+// =========================================================
 struct NativeUnicodeString {
     USHORT Length;
     USHORT MaximumLength;
     PWSTR Buffer;
 };
 
-constexpr NTSTATUS_T kStatusInfoLengthMismatch = static_cast<NTSTATUS_T>(0xC0000004L);
-constexpr NTSTATUS_T kStatusAccessDenied = static_cast<NTSTATUS_T>(0xC0000022L);
-constexpr NTSTATUS_T kStatusInvalidCid = static_cast<NTSTATUS_T>(0xC000000BL);
-constexpr NTSTATUS_T kStatusInvalidParameter = static_cast<NTSTATUS_T>(0xC000000DL);
-constexpr ULONG kSystemProcessInformation = 5;
-constexpr KPRIORITY kTargetPriority = 16;
-constexpr ULONG kHeapGrowable = 0x00000002;
-constexpr uint32_t kDefaultIntervalMs = 1000;
-constexpr uint32_t kGlobalRefreshScans = 60;
-constexpr uint32_t kRetryCooldownScans = 8192;
-constexpr uint32_t kRetryCooldownFixedScans = 2;
-constexpr uint32_t kCachedRefreshStride = 1;
-constexpr uint32_t kCachedProcessRescanScans = 2;
-constexpr size_t kThreadCacheSize = 512;
-constexpr size_t kProcessCacheSize = 64;
-constexpr size_t kCachedProcessesPerScan = 1;
-constexpr size_t kCachedThreadsPerProcessPerScan = 2;
-constexpr uint8_t kCacheEmpty = 0;
-constexpr uint8_t kCacheFixed = 1;
-constexpr uint8_t kCacheDenied = 2;
-constexpr uint8_t kCacheFailed = 3;
-const ACCESS_MASK kThreadFixAccess = THREAD_SET_INFORMATION;
-const ACCESS_MASK kThreadLimitedFixAccess = THREAD_SET_LIMITED_INFORMATION;
-const ACCESS_MASK kThreadQueryFixAccess = THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION;
-constexpr uint8_t kOpenFailureProtected = 1;
-constexpr uint8_t kOpenFailureTransient = 2;
-constexpr uint8_t kOpenFailureOther = 3;
-const ACCESS_MASK kProcessEnumAccess = PROCESS_QUERY_INFORMATION;
-
 struct NativeClientId {
     HANDLE UniqueProcess;
     HANDLE UniqueThread;
-};
-
-struct NativeObjectAttributes {
-    ULONG Length;
-    HANDLE RootDirectory;
-    PVOID ObjectName;
-    ULONG Attributes;
-    PVOID SecurityDescriptor;
-    PVOID SecurityQualityOfService;
 };
 
 struct NativeSystemThreadInformation {
@@ -107,8 +65,8 @@ struct NativeSystemThreadInformation {
     ULONG WaitTime;
     PVOID StartAddress;
     NativeClientId ClientId;
-    KPRIORITY Priority;
-    LONG BasePriority;
+    KPRIORITY_T Priority;
+    KPRIORITY_T BasePriority;
     ULONG ContextSwitches;
     ULONG ThreadState;
     ULONG WaitReason;
@@ -125,7 +83,7 @@ struct NativeSystemProcessInformation {
     LARGE_INTEGER UserTime;
     LARGE_INTEGER KernelTime;
     NativeUnicodeString ImageName;
-    KPRIORITY BasePriority;
+    KPRIORITY_T BasePriority;
     HANDLE UniqueProcessId;
     HANDLE InheritedFromUniqueProcessId;
     ULONG HandleCount;
@@ -152,758 +110,598 @@ struct NativeSystemProcessInformation {
     NativeSystemThreadInformation Threads[1];
 };
 
-using RtlAllocateHeapFn = PVOID(NTAPI*)(PVOID, ULONG, SIZE_T);
-using RtlFreeHeapFn = BOOLEAN(NTAPI*)(PVOID, ULONG, PVOID);
-using RtlCreateHeapFn = PVOID(NTAPI*)(ULONG, PVOID, SIZE_T, SIZE_T, PVOID, PVOID);
-using RtlDestroyHeapFn = PVOID(NTAPI*)(PVOID);
-using RtlReAllocateHeapFn = PVOID(NTAPI*)(PVOID, ULONG, PVOID, SIZE_T);
-using NtOpenProcessTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, ACCESS_MASK, PHANDLE);
-using NtAdjustPrivilegesTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, BOOLEAN, PTOKEN_PRIVILEGES, ULONG, PTOKEN_PRIVILEGES, PULONG);
-using NtQueryInformationTokenFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-using NtOpenThreadFn = NTSTATUS_T(NTAPI*)(PHANDLE, ACCESS_MASK, NativeObjectAttributes*, NativeClientId*);
-using NtOpenProcessFn = NTSTATUS_T(NTAPI*)(PHANDLE, ACCESS_MASK, NativeObjectAttributes*, NativeClientId*);
-using NtQuerySystemInformationFn = NTSTATUS_T(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
-using NtQueryInformationThreadFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-using NtSetInformationThreadFn = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
-using NtGetNextThreadFn = NTSTATUS_T(NTAPI*)(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
-using NtCloseFn = NTSTATUS_T(NTAPI*)(HANDLE);
-using NtDelayExecutionFn = NTSTATUS_T(NTAPI*)(BOOLEAN, PLARGE_INTEGER);
-
-struct NativeThreadBasicInformation {
-    NTSTATUS_T ExitStatus;
-    PVOID TebBaseAddress;
-    NativeClientId ClientId;
-    ULONG_PTR AffinityMask;
-    KPRIORITY Priority;
-    LONG BasePriority;
-};
-
-constexpr ULONG kThreadBasicInformation = 0;
-constexpr ULONG kThreadBasePriority = 3;
-constexpr KPRIORITY kNormalThreadBasePriority = 0;
-
-struct ScanStats {
-    uint32_t seenPriority16 = 0;
-    uint32_t fixedPriority16 = 0;
-    uint32_t cachedSkipped = 0;
-    uint32_t openFailures = 0;
-    uint32_t protectedFailures = 0;
-    uint32_t transientFailures = 0;
-    uint32_t fixFailures = 0;
+// =========================================================
+// DATA
+// =========================================================
+struct Snapshot {
+    ULONGLONG cycles = 0;
 };
 
 struct ThreadCacheEntry {
-    DWORD processId = 0;
-    DWORD threadId = 0;
-    uint32_t lastScan = 0;
-    uint8_t state = kCacheEmpty;
+    HANDLE handle = nullptr;
+    bool symbolResolved = false;
+    std::wstring originalSymbol;
 };
 
-struct ThreadCache {
-    ThreadCacheEntry entries[kThreadCacheSize]{};
+struct ThreadRow {
+    DWORD tid = 0;
+    std::wstring symbol;
+    std::wstring module;
+    ULONGLONG cyclesDelta = 0;
+    double cyclesShare = 0.0;
+    bool white = false;
+    std::wstring label;
 };
 
-struct ProcessCacheEntry {
-    DWORD processId = 0;
-    HANDLE process = nullptr;
-    uint32_t lastSeenScan = 0;
-    uint32_t lastScannedScan = 0;
+struct GroupBucket {
+    std::wstring symbol;
+    std::wstring module;
+    std::vector<size_t> members;
 };
 
-struct ProcessCache {
-    ProcessCacheEntry entries[kProcessCacheSize]{};
+struct GroupChunk {
+    std::wstring symbol;
+    std::wstring module;
+    std::vector<size_t> members;
+    ULONGLONG cyclesDeltaSum = 0;
+    double share = 0.0;
+    bool white = false;
+    std::wstring label;
 };
 
-static bool EqualsInsensitiveAscii(const WCHAR* text, size_t length, const char* ascii) noexcept {
-    for (size_t i = 0; i < length; ++i) {
-        char c = ascii[i];
-        if (c == '\0') {
-            return false;
-        }
+static NtQuerySystemInformation_t g_NtQuerySystemInformation = nullptr;
+static NtQueryVirtualMemory_t g_NtQueryVirtualMemory = nullptr;
+static SetThreadDescription_t g_SetThreadDescription = nullptr;
+static GetThreadDescription_t g_GetThreadDescription = nullptr;
 
-        WCHAR w = text[i];
-        if (w >= L'A' && w <= L'Z') {
-            w = static_cast<WCHAR>(w + (L'a' - L'A'));
-        }
-        if (c >= 'A' && c <= 'Z') {
-            c = static_cast<char>(c + ('a' - 'A'));
-        }
+static std::unordered_map<DWORD, Snapshot> g_previous;
+static std::unordered_map<DWORD, ThreadCacheEntry> g_threadCache;
+static std::unordered_map<uintptr_t, std::wstring> g_moduleCache;
 
-        if (w != static_cast<WCHAR>(c)) {
-            return false;
-        }
-    }
+// =========================================================
+// HELPERS
+// =========================================================
+std::wstring TimeNow() {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
 
-    return ascii[length] == '\0';
+    wchar_t buffer[64]{};
+    swprintf_s(buffer,
+        L"%04u-%02u-%02u %02u:%02u:%02u",
+        st.wYear,
+        st.wMonth,
+        st.wDay,
+        st.wHour,
+        st.wMinute,
+        st.wSecond);
+
+    return buffer;
 }
 
-static bool IsExcludedProcess(const NativeUnicodeString& imageName) noexcept {
-    if (imageName.Buffer == nullptr || imageName.Length == 0) {
+std::wstring Trim(const std::wstring& s) {
+    size_t start = 0;
+    while (start < s.size() && iswspace(s[start])) {
+        ++start;
+    }
+
+    size_t end = s.size();
+    while (end > start && iswspace(s[end - 1])) {
+        --end;
+    }
+
+    return s.substr(start, end - start);
+}
+
+double Clamp100(double v) {
+    if (v < 0.0) {
+        return 0.0;
+    }
+    if (v > 100.0) {
+        return 100.0;
+    }
+    return v;
+}
+
+bool StartsWithI(const std::wstring& text, const std::wstring& prefix) {
+    if (text.size() < prefix.size()) {
         return false;
     }
 
-    const size_t chars = imageName.Length / sizeof(WCHAR);
-    return EqualsInsensitiveAscii(imageName.Buffer, chars, "csrss.exe") ||
-        EqualsInsensitiveAscii(imageName.Buffer, chars, "system.exe") ||
-        EqualsInsensitiveAscii(imageName.Buffer, chars, "system");
-}
-
-static HANDLE NtCurrentProcessHandle() noexcept {
-    return reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-1));
-}
-
-static void EnableAllTokenPrivileges(RtlAllocateHeapFn allocateHeap,
-    RtlFreeHeapFn freeHeap,
-    PVOID heap,
-    NtOpenProcessTokenFn openProcessToken,
-    NtQueryInformationTokenFn queryToken,
-    NtAdjustPrivilegesTokenFn adjustToken,
-    NtCloseFn closeHandle) noexcept {
-    HANDLE token = nullptr;
-    if (openProcessToken(NtCurrentProcessHandle(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token) < 0) {
-        return;
-    }
-
-    ULONG required = 0;
-    queryToken(token, TokenPrivileges, nullptr, 0, &required);
-    if (required == 0) {
-        closeHandle(token);
-        return;
-    }
-
-    PVOID privileges = allocateHeap(heap, 0, required);
-    if (privileges == nullptr) {
-        closeHandle(token);
-        return;
-    }
-
-    auto* tokenPrivileges = reinterpret_cast<TOKEN_PRIVILEGES*>(privileges);
-    if (queryToken(token, TokenPrivileges, tokenPrivileges, required, &required) < 0) {
-        freeHeap(heap, 0, privileges);
-        closeHandle(token);
-        return;
-    }
-
-    for (DWORD i = 0; i < tokenPrivileges->PrivilegeCount; ++i) {
-        tokenPrivileges->Privileges[i].Attributes |= SE_PRIVILEGE_ENABLED;
-    }
-
-    adjustToken(token, FALSE, tokenPrivileges, required, nullptr, nullptr);
-    freeHeap(heap, 0, privileges);
-    closeHandle(token);
-}
-
-static uint32_t HashThreadKey(DWORD processId, DWORD threadId) noexcept {
-    uint32_t x = processId * 16777619u ^ threadId;
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    return x;
-}
-
-static bool ShouldSkipCachedThread(ThreadCache& cache, DWORD processId, DWORD threadId, uint32_t scanId) noexcept {
-    const size_t start = HashThreadKey(processId, threadId) & (kThreadCacheSize - 1);
-    for (size_t probe = 0; probe < 4; ++probe) {
-        ThreadCacheEntry& entry = cache.entries[(start + probe) & (kThreadCacheSize - 1)];
-        if (entry.state == kCacheEmpty) {
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        if (towlower(text[i]) != towlower(prefix[i])) {
             return false;
         }
-
-        if (entry.processId == processId && entry.threadId == threadId) {
-            const uint32_t age = scanId - entry.lastScan;
-            if (entry.state == kCacheFixed) {
-                return age < kRetryCooldownFixedScans;
-            }
-
-            return age < kRetryCooldownScans;
-        }
-    }
-
-    return false;
-}
-
-static void RememberThread(ThreadCache& cache, DWORD processId, DWORD threadId, uint32_t scanId, uint8_t state) noexcept {
-    const size_t start = HashThreadKey(processId, threadId) & (kThreadCacheSize - 1);
-    size_t slot = start;
-    uint32_t oldestAge = 0;
-
-    for (size_t probe = 0; probe < 4; ++probe) {
-        ThreadCacheEntry& entry = cache.entries[(start + probe) & (kThreadCacheSize - 1)];
-        if (entry.state == kCacheEmpty || (entry.processId == processId && entry.threadId == threadId)) {
-            slot = (start + probe) & (kThreadCacheSize - 1);
-            break;
-        }
-
-        const uint32_t age = scanId - entry.lastScan;
-        if (age >= oldestAge) {
-            oldestAge = age;
-            slot = (start + probe) & (kThreadCacheSize - 1);
-        }
-    }
-
-    cache.entries[slot] = ThreadCacheEntry{ processId, threadId, scanId, state };
-}
-
-static uint32_t ReadIntervalMs(int argc, wchar_t** argv) noexcept {
-    if (argc < 2) {
-        return kDefaultIntervalMs;
-    }
-
-    wchar_t* end = nullptr;
-    const unsigned long value = wcstoul(argv[1], &end, 10);
-    if (end == argv[1] || *end != L'\0' || value > 60000UL) {
-        return kDefaultIntervalMs;
-    }
-
-    return static_cast<uint32_t>(value);
-}
-
-static bool QueryProcessSnapshot(NtQuerySystemInformationFn query,
-    RtlAllocateHeapFn allocateHeap,
-    RtlReAllocateHeapFn reallocateHeap,
-    PVOID heap,
-    PVOID& buffer,
-    ULONG& capacity) noexcept {
-    ULONG required = 0;
-    NTSTATUS_T status = query(kSystemProcessInformation, buffer, capacity, &required);
-    while (status == kStatusInfoLengthMismatch) {
-        const ULONG nextCapacity = required > capacity ? required + (64U * 1024U) : capacity * 2U;
-        PVOID nextBuffer = reallocateHeap(heap, 0, buffer, nextCapacity);
-        if (nextBuffer == nullptr) {
-            return false;
-        }
-
-        buffer = nextBuffer;
-        capacity = nextCapacity;
-        required = 0;
-        status = query(kSystemProcessInformation, buffer, capacity, &required);
-    }
-
-    return status >= 0;
-}
-
-static bool FixPriority16ThreadHandle(NtSetInformationThreadFn setThread, HANDLE thread, DWORD& error) noexcept {
-    error = ERROR_SUCCESS;
-
-    KPRIORITY normalBasePriority = kNormalThreadBasePriority;
-    const NTSTATUS_T status = setThread(thread, kThreadBasePriority, &normalBasePriority, sizeof(normalBasePriority));
-    if (status < 0) {
-        if (status == kStatusAccessDenied) {
-            error = ERROR_ACCESS_DENIED;
-        }
-        else if (status == kStatusInvalidParameter) {
-            error = ERROR_INVALID_PARAMETER;
-        }
-        else {
-            error = ERROR_GEN_FAILURE;
-        }
-        return false;
     }
 
     return true;
 }
 
-static NTSTATUS_T TryOpenPriorityThread(NtOpenThreadFn openThread,
-    DWORD processId,
-    DWORD threadId,
-    ACCESS_MASK desiredAccess,
-    bool includeProcessId,
-    HANDLE& thread) noexcept {
-    thread = nullptr;
-    NativeObjectAttributes attributes{ sizeof(attributes), nullptr, nullptr, 0, nullptr, nullptr };
-    NativeClientId clientId{ includeProcessId ? reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(processId)) : nullptr,
-                         reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(threadId)) };
-    return openThread(&thread, desiredAccess, &attributes, &clientId);
-}
+std::wstring NormalizeSymbol(const std::wstring& s) {
+    std::wstring out = Trim(s);
 
-static uint8_t ClassifyOpenStatus(NTSTATUS_T status) noexcept {
-    if (status == kStatusInvalidCid || status == kStatusInvalidParameter) {
-        return kOpenFailureTransient;
+    if (out.empty() || StartsWithI(out, L"TopGWhiteWorker/") || StartsWithI(out, L"TopGBlackWorker/")) {
+        return L"-";
     }
 
-    if (status == kStatusAccessDenied) {
-        return kOpenFailureProtected;
-    }
-
-    return kOpenFailureOther;
+    return out;
 }
 
-static bool OpenPriorityFixThread(NtOpenThreadFn openThread,
-    DWORD processId,
-    DWORD threadId,
-    HANDLE& thread,
-    uint8_t& failureKind) noexcept {
-    const ACCESS_MASK accessMasks[] = {
-        kThreadFixAccess
-    };
-
-    NTSTATUS_T lastStatus = kStatusAccessDenied;
-    for (size_t i = 0; i < sizeof(accessMasks) / sizeof(accessMasks[0]); ++i) {
-        const ACCESS_MASK desiredAccess = accessMasks[i];
-        lastStatus = TryOpenPriorityThread(openThread, processId, threadId, desiredAccess, true, thread);
-        if (lastStatus >= 0 && thread != nullptr) {
-            return true;
-        }
-    }
-
-    failureKind = ClassifyOpenStatus(lastStatus);
-    return false;
-}
-
-static HANDLE OpenProcessNative(NtOpenProcessFn openProcess, DWORD processId, ACCESS_MASK desiredAccess) noexcept {
-    HANDLE process = nullptr;
-    NativeObjectAttributes attributes{ sizeof(attributes), nullptr, nullptr, 0, nullptr, nullptr };
-    NativeClientId clientId{ reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(processId)), nullptr };
-    if (openProcess(&process, desiredAccess, &attributes, &clientId) < 0) {
-        return nullptr;
-    }
-
-    return process;
-}
-
-static HANDLE OpenCachedProcess(NtOpenProcessFn openProcess, DWORD processId) noexcept {
-    return OpenProcessNative(openProcess, processId, kProcessEnumAccess);
-}
-
-static bool OpenPriorityFixThreadFromProcess(NtGetNextThreadFn getNextThread,
-    NtQueryInformationThreadFn queryThread,
-    NtOpenProcessFn openProcess,
-    NtCloseFn closeHandle,
-    DWORD processId,
-    DWORD threadId,
-    HANDLE& thread) noexcept {
-    thread = nullptr;
-
-    HANDLE process = OpenCachedProcess(openProcess, processId);
-    if (process == nullptr) {
+bool InitNt() {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) {
         return false;
     }
 
-    HANDLE previousThread = nullptr;
-    for (;;) {
-        HANDLE candidate = nullptr;
-        const NTSTATUS_T status = getNextThread(process,
-            previousThread,
-            kThreadQueryFixAccess,
-            0,
-            0,
-            &candidate);
-        if (previousThread != nullptr) {
-            closeHandle(previousThread);
-        }
+    g_NtQuerySystemInformation = reinterpret_cast<NtQuerySystemInformation_t>(
+        GetProcAddress(ntdll, "NtQuerySystemInformation"));
+    g_NtQueryVirtualMemory = reinterpret_cast<NtQueryVirtualMemory_t>(
+        GetProcAddress(ntdll, "NtQueryVirtualMemory"));
 
-        if (status < 0 || candidate == nullptr) {
-            closeHandle(process);
-            return false;
-        }
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (kernel32) {
+        g_SetThreadDescription = reinterpret_cast<SetThreadDescription_t>(
+            GetProcAddress(kernel32, "SetThreadDescription"));
+        g_GetThreadDescription = reinterpret_cast<GetThreadDescription_t>(
+            GetProcAddress(kernel32, "GetThreadDescription"));
+    }
 
-        previousThread = candidate;
-        NativeThreadBasicInformation basic{};
-        if (queryThread(candidate, kThreadBasicInformation, &basic, sizeof(basic), nullptr) < 0) {
+    return g_NtQuerySystemInformation != nullptr &&
+        g_NtQueryVirtualMemory != nullptr &&
+        g_GetThreadDescription != nullptr;
+}
+
+bool QueryProcesses(std::vector<BYTE>& buffer) {
+    ULONG size = 1024 * 1024;
+
+    while (true) {
+        buffer.resize(size);
+        ULONG needed = 0;
+        NTSTATUS_T status = g_NtQuerySystemInformation(
+            SYSTEM_PROCESS_INFORMATION_CLASS,
+            buffer.data(),
+            size,
+            &needed);
+
+        if (status == STATUS_INFO_LENGTH_MISMATCH_VALUE) {
+            size = (needed > size) ? needed + 1024 * 256 : size * 2;
             continue;
         }
 
-        const DWORD candidateThreadId = static_cast<DWORD>(
-            reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueThread));
-        if (candidateThreadId == threadId) {
-            thread = candidate;
-            closeHandle(process);
-            return true;
-        }
+        return status >= 0;
     }
 }
 
-static bool FixPriority16Thread(NtOpenThreadFn openThread,
-    NtGetNextThreadFn getNextThread,
-    NtQueryInformationThreadFn queryThread,
-    NtSetInformationThreadFn setThread,
-    NtOpenProcessFn openProcess,
-    NtCloseFn closeHandle,
-    DWORD processId,
-    DWORD threadId,
-    DWORD& error,
-    uint8_t& openFailureKind) noexcept {
-    error = ERROR_SUCCESS;
-    HANDLE thread = nullptr;
-    const bool openedDirect = OpenPriorityFixThread(openThread, processId, threadId, thread, openFailureKind);
-    if (!openedDirect) {
-        error = ERROR_ACCESS_DENIED;
+NativeSystemProcessInformation* FindGame(std::vector<BYTE>& buffer, DWORD& pidOut) {
+    auto* proc = reinterpret_cast<NativeSystemProcessInformation*>(buffer.data());
+
+    while (true) {
+        std::wstring name;
+        if (proc->ImageName.Buffer && proc->ImageName.Length > 0) {
+            name.assign(proc->ImageName.Buffer, proc->ImageName.Length / sizeof(WCHAR));
+        }
+
+        if (_wcsicmp(name.c_str(), TARGET_GAME) == 0) {
+            pidOut = static_cast<DWORD>(reinterpret_cast<uintptr_t>(proc->UniqueProcessId));
+            return proc;
+        }
+
+        if (proc->NextEntryOffset == 0) {
+            break;
+        }
+
+        proc = reinterpret_cast<NativeSystemProcessInformation*>(
+            reinterpret_cast<BYTE*>(proc) + proc->NextEntryOffset);
+    }
+
+    return nullptr;
+}
+
+std::wstring GetProcessName(NativeSystemProcessInformation* proc) {
+    if (proc && proc->ImageName.Buffer && proc->ImageName.Length > 0) {
+        return std::wstring(proc->ImageName.Buffer, proc->ImageName.Length / sizeof(WCHAR));
+    }
+    return L"-";
+}
+
+HANDLE GetCachedThreadHandle(DWORD tid) {
+    auto& entry = g_threadCache[tid];
+    if (entry.handle) {
+        return entry.handle;
+    }
+
+    entry.handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION, FALSE, tid);
+    return entry.handle;
+}
+
+void CloseThreadCacheEntry(DWORD tid) {
+    auto it = g_threadCache.find(tid);
+    if (it != g_threadCache.end()) {
+        if (it->second.handle) {
+            CloseHandle(it->second.handle);
+        }
+        g_threadCache.erase(it);
+    }
+}
+
+std::wstring GetThreadOriginalSymbolCached(DWORD tid) {
+    auto& entry = g_threadCache[tid];
+
+    if (entry.symbolResolved) {
+        return entry.originalSymbol;
+    }
+
+    entry.symbolResolved = true;
+
+    HANDLE hThread = GetCachedThreadHandle(tid);
+    if (!hThread || !g_GetThreadDescription) {
+        entry.originalSymbol = L"-";
+        return entry.originalSymbol;
+    }
+
+    PWSTR rawName = nullptr;
+    HRESULT hr = g_GetThreadDescription(hThread, &rawName);
+    if (FAILED(hr) || !rawName) {
+        entry.originalSymbol = L"-";
+        return entry.originalSymbol;
+    }
+
+    std::wstring resolved = NormalizeSymbol(rawName);
+    LocalFree(rawName);
+
+    entry.originalSymbol = resolved;
+    return entry.originalSymbol;
+}
+
+bool SetThreadName(DWORD tid, const std::wstring& newName) {
+    if (!g_SetThreadDescription) {
         return false;
     }
 
-    const bool ok = FixPriority16ThreadHandle(setThread, thread, error);
-    closeHandle(thread);
-    return ok;
+    HANDLE hThread = GetCachedThreadHandle(tid);
+    if (!hThread) {
+        return false;
+    }
+
+    HRESULT hr = g_SetThreadDescription(hThread, newName.c_str());
+    return SUCCEEDED(hr);
 }
 
-static void RememberProcess(ProcessCache& cache,
-    NtOpenProcessFn openProcess,
-    NtCloseFn closeHandle,
-    DWORD processId,
-    uint32_t scanId) noexcept {
-    if (processId == 0) {
-        return;
+ULONGLONG GetThreadCycles(DWORD tid) {
+    HANDLE hThread = GetCachedThreadHandle(tid);
+    if (!hThread) {
+        return 0;
     }
 
-    size_t slot = kProcessCacheSize;
-    uint32_t oldestAge = 0;
-    for (size_t i = 0; i < kProcessCacheSize; ++i) {
-        ProcessCacheEntry& entry = cache.entries[i];
-        if (entry.processId == processId) {
-            entry.lastSeenScan = scanId;
-            return;
-        }
-
-        if (entry.processId == 0) {
-            slot = i;
-            break;
-        }
-
-        const uint32_t age = scanId - entry.lastSeenScan;
-        if (age >= oldestAge) {
-            oldestAge = age;
-            slot = i;
-        }
+    ULONG64 cycles = 0;
+    if (!QueryThreadCycleTime(hThread, &cycles)) {
+        return 0;
     }
 
-    if (slot == kProcessCacheSize) {
-        return;
-    }
-
-    if (cache.entries[slot].process != nullptr) {
-        closeHandle(cache.entries[slot].process);
-    }
-
-    cache.entries[slot] = ProcessCacheEntry{ processId, OpenCachedProcess(openProcess, processId), scanId, 0 };
+    return static_cast<ULONGLONG>(cycles);
 }
 
-static ScanStats ScanAndFixPriority16(NtQuerySystemInformationFn query,
-    RtlAllocateHeapFn allocateHeap,
-    RtlReAllocateHeapFn reallocateHeap,
-    PVOID heap,
-    NtOpenThreadFn openThread,
-    NtGetNextThreadFn getNextThread,
-    NtQueryInformationThreadFn queryThread,
-    NtSetInformationThreadFn setThread,
-    NtOpenProcessFn openProcess,
-    NtCloseFn closeHandle,
-    PVOID& buffer,
-    ULONG& capacity,
-    ThreadCache& threadCache,
-    ProcessCache& processCache,
-    uint32_t scanId) noexcept {
-    ScanStats stats{};
-    if (!QueryProcessSnapshot(query, allocateHeap, reallocateHeap, heap, buffer, capacity)) {
-        return stats;
+std::wstring QuerySectionName(HANDLE hProcess, uintptr_t address) {
+    auto it = g_moduleCache.find(address);
+    if (it != g_moduleCache.end()) {
+        return it->second;
     }
 
-    const DWORD currentThreadId = GetCurrentThreadId();
-    auto* process = reinterpret_cast<NativeSystemProcessInformation*>(buffer);
-    for (;;) {
-        const bool skipProcess = IsExcludedProcess(process->ImageName);
-        const ULONG threadCount = process->NumberOfThreads;
-        const NativeSystemThreadInformation* thread = process->Threads;
-
-        if (!skipProcess) {
-            for (ULONG i = 0; i < threadCount; ++i, ++thread) {
-                if (thread->Priority != kTargetPriority && thread->BasePriority != kTargetPriority) {
-                    continue;
-                }
-
-                const DWORD processId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(thread->ClientId.UniqueProcess));
-                const DWORD threadId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(thread->ClientId.UniqueThread));
-                if (threadId == 0 || threadId == currentThreadId) {
-                    continue;
-                }
-
-                ++stats.seenPriority16;
-                RememberProcess(processCache, openProcess, closeHandle, processId, scanId);
-                if (ShouldSkipCachedThread(threadCache, processId, threadId, scanId)) {
-                    ++stats.cachedSkipped;
-                    continue;
-                }
-
-                DWORD error = ERROR_SUCCESS;
-                uint8_t openFailureKind = kOpenFailureOther;
-                if (FixPriority16Thread(openThread,
-                    getNextThread,
-                    queryThread,
-                    setThread,
-                    openProcess,
-                    closeHandle,
-                    processId,
-                    threadId,
-                    error,
-                    openFailureKind)) {
-                    ++stats.fixedPriority16;
-                    RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
-                }
-                else if (error == ERROR_ACCESS_DENIED) {
-                    if (openFailureKind == kOpenFailureTransient) {
-                        ++stats.openFailures;
-                        ++stats.transientFailures;
-                    }
-                    else if (openFailureKind == kOpenFailureProtected) {
-                        ++stats.protectedFailures;
-                    }
-                    else {
-                        ++stats.openFailures;
-                    }
-
-                    RememberThread(threadCache, processId, threadId, scanId,
-                        openFailureKind == kOpenFailureTransient ? kCacheEmpty : kCacheDenied);
-                }
-                else {
-                    ++stats.fixFailures;
-                    RememberThread(threadCache, processId, threadId, scanId, kCacheFailed);
-                }
-            }
-        }
-
-        if (process->NextEntryOffset == 0) {
-            break;
-        }
-
-        process = reinterpret_cast<NativeSystemProcessInformation*>(
-            reinterpret_cast<BYTE*>(process) + process->NextEntryOffset);
+    if (!g_NtQueryVirtualMemory || !hProcess) {
+        g_moduleCache[address] = L"-";
+        return L"-";
     }
 
-    return stats;
-}
+    std::vector<BYTE> buffer(1024);
+    while (true) {
+        SIZE_T retLen = 0;
+        NTSTATUS_T status = g_NtQueryVirtualMemory(
+            hProcess,
+            reinterpret_cast<PVOID>(address),
+            MEMORY_SECTION_NAME_CLASS,
+            buffer.data(),
+            buffer.size(),
+            &retLen);
 
-static void CloseProcessCache(ProcessCache& processCache, NtCloseFn closeHandle) noexcept {
-    for (ProcessCacheEntry& entry : processCache.entries) {
-        if (entry.process != nullptr) {
-            closeHandle(entry.process);
-            entry.process = nullptr;
-        }
-    }
-}
-
-static ScanStats ScanCachedPriority16Processes(NtGetNextThreadFn getNextThread,
-    NtQueryInformationThreadFn queryThread,
-    NtSetInformationThreadFn setThread,
-    NtOpenProcessFn openProcess,
-    NtCloseFn closeHandle,
-    ThreadCache& threadCache,
-    ProcessCache& processCache,
-    size_t& processCursor,
-    uint32_t scanId) noexcept {
-    ScanStats stats{};
-    const DWORD currentThreadId = GetCurrentThreadId();
-
-    size_t visited = 0;
-    size_t handled = 0;
-    while (visited < kProcessCacheSize && handled < kCachedProcessesPerScan) {
-        ProcessCacheEntry& processEntry = processCache.entries[(processCursor + visited) % kProcessCacheSize];
-        ++visited;
-        if (processEntry.processId == 0) {
+        if (status == STATUS_INFO_LENGTH_MISMATCH_VALUE) {
+            buffer.resize(buffer.size() * 2);
             continue;
         }
-        ++handled;
-        if (scanId - processEntry.lastScannedScan < kCachedProcessRescanScans) {
+
+        if (status < 0) {
+            g_moduleCache[address] = L"-";
+            return L"-";
+        }
+
+        break;
+    }
+
+    auto* u = reinterpret_cast<NativeUnicodeString*>(buffer.data());
+    if (!u || !u->Buffer || u->Length == 0) {
+        g_moduleCache[address] = L"-";
+        return L"-";
+    }
+
+    std::wstring fullPath(u->Buffer, u->Length / sizeof(WCHAR));
+    fullPath = Trim(fullPath);
+
+    size_t slash = fullPath.find_last_of(L"\\/");
+    std::wstring module = (slash == std::wstring::npos) ? fullPath : fullPath.substr(slash + 1);
+    if (module.empty()) {
+        module = L"-";
+    }
+
+    g_moduleCache[address] = module;
+    return module;
+}
+
+void ClearCaches() {
+    for (auto& kv : g_threadCache) {
+        if (kv.second.handle) {
+            CloseHandle(kv.second.handle);
+        }
+    }
+
+    g_threadCache.clear();
+    g_moduleCache.clear();
+    g_previous.clear();
+}
+
+DWORD GetForegroundPid() {
+    HWND hwnd = GetForegroundWindow();
+    if (!hwnd) {
+        return 0;
+    }
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    return pid;
+}
+
+void BuildExactTriplesFromBucket(
+    const GroupBucket& bucket,
+    const std::vector<ThreadRow>& rows,
+    ULONGLONG totalCyclesDelta,
+    std::vector<GroupChunk>& outChunks) {
+    std::vector<size_t> ordered = bucket.members;
+
+    // Stable, deterministic order: do not sort by live CPU usage, otherwise triplets reshuffle randomly each sample.
+    std::sort(ordered.begin(), ordered.end(), [&](size_t a, size_t b) {
+        return rows[a].tid < rows[b].tid;
+    });
+
+    for (size_t start = 0; start + THREADS_PER_GROUP <= ordered.size(); start += THREADS_PER_GROUP) {
+        GroupChunk chunk;
+        chunk.symbol = bucket.symbol;
+        chunk.module = bucket.module;
+        chunk.members.reserve(THREADS_PER_GROUP);
+
+        for (size_t i = start; i < start + THREADS_PER_GROUP; ++i) {
+            chunk.members.push_back(ordered[i]);
+            chunk.cyclesDeltaSum += rows[ordered[i]].cyclesDelta;
+        }
+
+        if (totalCyclesDelta > 0) {
+            chunk.share = Clamp100(static_cast<double>(chunk.cyclesDeltaSum) /
+                static_cast<double>(totalCyclesDelta) * 100.0);
+        }
+
+        chunk.white = chunk.share >= TOPG_THRESHOLD;
+        outChunks.push_back(std::move(chunk));
+    }
+}
+
+int wmain() {
+    if (!InitNt()) {
+        std::wcerr << L"NT init failed\n";
+        return 1;
+    }
+
+    std::wofstream log(L"topg_log.txt", std::ios::app);
+    if (!log.is_open()) {
+        std::wcerr << L"log open failed\n";
+        return 1;
+    }
+
+    bool baseline = false;
+    DWORD lastForegroundPid = 0;
+
+    log << L"=== TopG detector started " << TimeNow() << L" target=" << TARGET_GAME << L" ===\n";
+    log.flush();
+
+    while (true) {
+        std::this_thread::sleep_for(SAMPLE_INTERVAL);
+
+        DWORD foregroundPid = GetForegroundPid();
+        if (!foregroundPid) {
             continue;
         }
-        processEntry.lastScannedScan = scanId;
 
-        if (processEntry.process == nullptr) {
-            processEntry.process = OpenCachedProcess(openProcess, processEntry.processId);
-            if (processEntry.process == nullptr) {
-                continue;
+        if (lastForegroundPid != 0 && foregroundPid != lastForegroundPid) {
+            ClearCaches();
+            baseline = false;
+        }
+        lastForegroundPid = foregroundPid;
+
+        std::vector<BYTE> buffer;
+        if (!QueryProcesses(buffer)) {
+            continue;
+        }
+
+        DWORD pid = 0;
+        auto* proc = FindGame(buffer, pid);
+        if (!proc) {
+            continue;
+        }
+
+        std::wstring processName = GetProcessName(proc);
+
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (!hProcess) {
+            continue;
+        }
+
+        if (!baseline) {
+            ClearCaches();
+
+            for (ULONG i = 0; i < proc->NumberOfThreads; ++i) {
+                const auto& t = proc->Threads[i];
+                DWORD tid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(t.ClientId.UniqueThread));
+                g_previous[tid] = { GetThreadCycles(tid) };
+            }
+
+            baseline = true;
+            CloseHandle(hProcess);
+            continue;
+        }
+
+        std::vector<ThreadRow> rows;
+        rows.reserve(proc->NumberOfThreads);
+
+        std::unordered_set<DWORD> seen;
+        ULONGLONG totalCyclesDelta = 0;
+
+        for (ULONG i = 0; i < proc->NumberOfThreads; ++i) {
+            const auto& t = proc->Threads[i];
+            DWORD tid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(t.ClientId.UniqueThread));
+            seen.insert(tid);
+
+            ULONGLONG cyclesNow = GetThreadCycles(tid);
+            ULONGLONG cyclesDelta = 0;
+            auto it = g_previous.find(tid);
+            if (it != g_previous.end() && cyclesNow >= it->second.cycles) {
+                cyclesDelta = cyclesNow - it->second.cycles;
+            }
+
+            g_previous[tid] = { cyclesNow };
+            totalCyclesDelta += cyclesDelta;
+
+            std::wstring symbol = Trim(GetThreadOriginalSymbolCached(tid));
+            std::wstring module = Trim(QuerySectionName(hProcess, reinterpret_cast<uintptr_t>(t.StartAddress)));
+
+            rows.push_back({ tid, symbol, module, cyclesDelta, 0.0, false, L"" });
+        }
+
+        for (auto& r : rows) {
+            if (totalCyclesDelta > 0) {
+                r.cyclesShare = Clamp100(static_cast<double>(r.cyclesDelta) /
+                    static_cast<double>(totalCyclesDelta) * 100.0);
             }
         }
 
-        HANDLE previousThread = nullptr;
-        size_t processTried = 0;
-        for (;;) {
-            HANDLE thread = nullptr;
-            const NTSTATUS_T status = getNextThread(processEntry.process,
-                previousThread,
-                kThreadQueryFixAccess,
-                0,
-                0,
-                &thread);
-            if (previousThread != nullptr) {
-                closeHandle(previousThread);
-            }
+        // Exact grouping by SAME symbol + SAME module only. Unresolved names/modules are isolated.
+        std::unordered_map<std::wstring, GroupBucket> buckets;
+        buckets.reserve(rows.size());
 
-            if (status < 0 || thread == nullptr) {
-                break;
-            }
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto& r = rows[i];
 
-            previousThread = thread;
-            NativeThreadBasicInformation basic{};
-            if (queryThread(thread, kThreadBasicInformation, &basic, sizeof(basic), nullptr) < 0) {
-                continue;
-            }
-
-            const DWORD processId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueProcess));
-            const DWORD threadId = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(basic.ClientId.UniqueThread));
-            if (threadId == 0 || threadId == currentThreadId) {
-                continue;
-            }
-
-            if (basic.Priority != kTargetPriority && basic.BasePriority != kTargetPriority) {
-                continue;
-            }
-
-            ++stats.seenPriority16;
-            if (ShouldSkipCachedThread(threadCache, processId, threadId, scanId)) {
-                ++stats.cachedSkipped;
-                continue;
-            }
-
-            DWORD error = ERROR_SUCCESS;
-            ++processTried;
-            if (FixPriority16ThreadHandle(setThread, thread, error)) {
-                ++stats.fixedPriority16;
-                RememberThread(threadCache, processId, threadId, scanId, kCacheFixed);
-            }
-            else if (error == ERROR_ACCESS_DENIED) {
-                ++stats.openFailures;
-                RememberThread(threadCache, processId, threadId, scanId, kCacheDenied);
+            std::wstring key;
+            if (r.symbol == L"-" || r.module == L"-") {
+                key = L"__UNRESOLVED__" + std::to_wstring(r.tid);
             }
             else {
-                ++stats.fixFailures;
-                RememberThread(threadCache, processId, threadId, scanId, kCacheFailed);
+                key = r.symbol;
+                key.push_back(L'\x1f');
+                key += r.module;
             }
 
-            if (processTried >= kCachedThreadsPerProcessPerScan) {
-                break;
+            auto& b = buckets[key];
+            if (b.members.empty()) {
+                b.symbol = r.symbol;
+                b.module = r.module;
+            }
+
+            b.members.push_back(i);
+        }
+
+        std::vector<GroupChunk> chunks;
+        chunks.reserve(rows.size() / THREADS_PER_GROUP);
+
+        for (const auto& kv : buckets) {
+            BuildExactTriplesFromBucket(kv.second, rows, totalCyclesDelta, chunks);
+        }
+
+        std::sort(chunks.begin(), chunks.end(), [](const GroupChunk& a, const GroupChunk& b) {
+            if (a.white != b.white) {
+                return a.white > b.white;
+            }
+            if (a.share != b.share) {
+                return a.share > b.share;
+            }
+            if (a.symbol != b.symbol) {
+                return a.symbol < b.symbol;
+            }
+            if (a.module != b.module) {
+                return a.module < b.module;
+            }
+            return a.members < b.members;
+        });
+
+        size_t whiteGroupNo = 1;
+        size_t blackGroupNo = 1;
+
+        for (auto& chunk : chunks) {
+            if (chunk.white) {
+                chunk.label = L"TopGWhiteWorker/" + std::to_wstring(whiteGroupNo++);
+                for (size_t idx : chunk.members) {
+                    rows[idx].white = true;
+                    rows[idx].label = chunk.label;
+                    SetThreadName(rows[idx].tid, chunk.label);
+                }
+            }
+            else {
+                chunk.label = L"TopGBlackWorker/" + std::to_wstring(blackGroupNo++);
+                for (size_t idx : chunk.members) {
+                    rows[idx].white = false;
+                    rows[idx].label = chunk.label;
+                }
             }
         }
-    }
-    processCursor = (processCursor + handled) % kProcessCacheSize;
 
-    return stats;
-}
-
-int wmain(int argc, wchar_t** argv) {
-    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (ntdll == nullptr) {
-        std::fputs("ntdll.dll is unavailable\n", stderr);
-        return 1;
-    }
-
-    const auto allocateHeap = reinterpret_cast<RtlAllocateHeapFn>(GetProcAddress(ntdll, "RtlAllocateHeap"));
-    const auto freeHeap = reinterpret_cast<RtlFreeHeapFn>(GetProcAddress(ntdll, "RtlFreeHeap"));
-    const auto reallocateHeap = reinterpret_cast<RtlReAllocateHeapFn>(GetProcAddress(ntdll, "RtlReAllocateHeap"));
-    const auto createHeap = reinterpret_cast<RtlCreateHeapFn>(GetProcAddress(ntdll, "RtlCreateHeap"));
-    const auto destroyHeap = reinterpret_cast<RtlDestroyHeapFn>(GetProcAddress(ntdll, "RtlDestroyHeap"));
-    const auto openProcessToken = reinterpret_cast<NtOpenProcessTokenFn>(
-        GetProcAddress(ntdll, "NtOpenProcessToken"));
-    const auto queryToken = reinterpret_cast<NtQueryInformationTokenFn>(
-        GetProcAddress(ntdll, "NtQueryInformationToken"));
-    const auto adjustToken = reinterpret_cast<NtAdjustPrivilegesTokenFn>(
-        GetProcAddress(ntdll, "NtAdjustPrivilegesToken"));
-    const auto openProcess = reinterpret_cast<NtOpenProcessFn>(GetProcAddress(ntdll, "NtOpenProcess"));
-    const auto closeHandle = reinterpret_cast<NtCloseFn>(GetProcAddress(ntdll, "NtClose"));
-    const auto delayExecution = reinterpret_cast<NtDelayExecutionFn>(GetProcAddress(ntdll, "NtDelayExecution"));
-    if (allocateHeap == nullptr || freeHeap == nullptr || reallocateHeap == nullptr ||
-        createHeap == nullptr || destroyHeap == nullptr ||
-        openProcessToken == nullptr ||
-        queryToken == nullptr || adjustToken == nullptr || openProcess == nullptr ||
-        closeHandle == nullptr || delayExecution == nullptr) {
-        std::fputs("required ntdll memory APIs are unavailable\n", stderr);
-        return 1;
-    }
-
-    PVOID heap = createHeap(kHeapGrowable, nullptr, 0, 0, nullptr, nullptr);
-    if (heap == nullptr) {
-        std::fputs("RtlCreateHeap failed\n", stderr);
-        return 1;
-    }
-
-    EnableAllTokenPrivileges(allocateHeap, freeHeap, heap, openProcessToken, queryToken, adjustToken, closeHandle);
-
-    const auto openThread = reinterpret_cast<NtOpenThreadFn>(GetProcAddress(ntdll, "NtOpenThread"));
-    const auto query = reinterpret_cast<NtQuerySystemInformationFn>(
-        GetProcAddress(ntdll, "NtQuerySystemInformation"));
-    const auto queryThread = reinterpret_cast<NtQueryInformationThreadFn>(
-        GetProcAddress(ntdll, "NtQueryInformationThread"));
-    const auto setThread = reinterpret_cast<NtSetInformationThreadFn>(
-        GetProcAddress(ntdll, "NtSetInformationThread"));
-    const auto getNextThread = reinterpret_cast<NtGetNextThreadFn>(
-        GetProcAddress(ntdll, "NtGetNextThread"));
-    if (openThread == nullptr || query == nullptr || queryThread == nullptr || setThread == nullptr || getNextThread == nullptr) {
-        std::fputs("required ntdll thread query APIs are unavailable\n", stderr);
-        return 1;
-    }
-
-    ULONG capacity = 256U * 1024U;
-    PVOID buffer = allocateHeap(heap, 0, capacity);
-    if (buffer == nullptr) {
-        capacity = 64U * 1024U;
-        buffer = allocateHeap(heap, 0, capacity);
-    }
-    if (buffer == nullptr) {
-        std::fputs("failed to allocate snapshot buffer\n", stderr);
-        destroyHeap(heap);
-        return 1;
-    }
-    ThreadCache threadCache{};
-    ProcessCache processCache{};
-    size_t processCursor = 0;
-    uint32_t scanId = 1;
-    const uint32_t intervalMs = ReadIntervalMs(argc, argv);
-
-    if (intervalMs != 0) {
-        std::printf("monitoring priority 16 threads every %u ms; global refresh every %u scans; cached budget=%zu process/scan; pass 0 for one scan\n",
-            intervalMs, kGlobalRefreshScans, kCachedProcessesPerScan);
-    }
-
-    do {
-        const bool globalRefresh = intervalMs == 0 || scanId == 1 || (scanId % kGlobalRefreshScans) == 0;
-        const bool cachedRefresh = !globalRefresh && (scanId % kCachedRefreshStride) == 0;
-        const ScanStats stats = globalRefresh
-            ? ScanAndFixPriority16(query,
-                allocateHeap,
-                reallocateHeap,
-                heap,
-                openThread,
-                getNextThread,
-                queryThread,
-                setThread,
-                openProcess,
-                closeHandle,
-                buffer,
-                capacity,
-                threadCache,
-                processCache,
-                scanId++)
-            : (cachedRefresh
-                ? ScanCachedPriority16Processes(getNextThread,
-                    queryThread,
-                    setThread,
-                    openProcess,
-                    closeHandle,
-                    threadCache,
-                    processCache,
-                    processCursor,
-                    scanId++)
-                : ScanStats{});
-        if (intervalMs == 0 || stats.fixedPriority16 != 0 || stats.openFailures != 0 || stats.fixFailures != 0) {
-            std::printf("priority16_seen=%u priority16_fixed=%u cached_skipped=%u open_failures=%u protected_failures=%u transient_failures=%u fix_failures=%u\n",
-                stats.seenPriority16,
-                stats.fixedPriority16,
-                stats.cachedSkipped,
-                stats.openFailures,
-                stats.protectedFailures,
-                stats.transientFailures,
-                stats.fixFailures);
+        for (auto it = g_previous.begin(); it != g_previous.end();) {
+            if (seen.find(it->first) == seen.end()) {
+                CloseThreadCacheEntry(it->first);
+                it = g_previous.erase(it);
+            }
+            else {
+                ++it;
+            }
         }
 
-        if (intervalMs == 0) {
-            break;
+        std::sort(rows.begin(), rows.end(), [](const ThreadRow& a, const ThreadRow& b) {
+            return a.cyclesShare > b.cyclesShare;
+        });
+
+        log << L"\n[" << TimeNow() << L"] PID=" << pid << L" Process=" << processName << L"\n";
+
+        log << L"Groups (exactly " << THREADS_PER_GROUP << L" threads per group):\n";
+        for (const auto& c : chunks) {
+            log << L"  "
+                << (c.white ? L"TopGWhiteWorker" : L"TopGBlackWorker")
+                << L" Label=" << c.label
+                << L" Symbol=" << c.symbol
+                << L" Module=" << c.module
+                << L" CyclesSum=" << c.cyclesDeltaSum
+                << L" Share=" << std::fixed << std::setprecision(2) << c.share << L"%"
+                << L" Members=" << c.members.size()
+                << L"\n";
         }
 
-        LARGE_INTEGER delay{};
-        delay.QuadPart = -static_cast<LONGLONG>(intervalMs) * 10000LL;
-        delayExecution(FALSE, &delay);
-    } while (true);
+        log << L"Threads:\n";
+        for (const auto& r : rows) {
+            log << L"  TID=" << r.tid
+                << L" Name=" << (r.white ? r.label : r.symbol)
+                << L" Symbol=" << r.symbol
+                << L" Module=" << r.module
+                << L" CyclesDelta=" << r.cyclesDelta
+                << L" Share=" << std::fixed << std::setprecision(2) << r.cyclesShare << L"%"
+                << L" White=" << (r.white ? L"YES" : L"NO")
+                << L"\n";
+        }
 
-    CloseProcessCache(processCache, closeHandle);
-    freeHeap(heap, 0, buffer);
-    destroyHeap(heap);
+        log.flush();
+        CloseHandle(hProcess);
+    }
+
     return 0;
 }
