@@ -840,11 +840,19 @@ int wmain() {
         }
 
         // Exact grouping by SAME start-address symbol + SAME module only. Thread names/descriptions are not used for grouping.
+        // A thread that already reaches TOPG_THRESHOLD alone is not a group candidate: do not let one solo-hot
+        // thread pull weaker helper threads into a white group.
         std::unordered_map<std::wstring, GroupBucket> buckets;
         buckets.reserve(rows.size());
+        std::vector<size_t> soloThresholdMembers;
 
         for (size_t i = 0; i < rows.size(); ++i) {
             const auto& r = rows[i];
+
+            if (r.cyclesShare >= TOPG_THRESHOLD) {
+                soloThresholdMembers.push_back(i);
+                continue;
+            }
 
             std::wstring key;
             if (r.symbol == L"-" || r.module == L"-") {
@@ -978,6 +986,21 @@ int wmain() {
                 << L" Memory=" << g_groupMemory[c.key].thresholdHits << L"/" << g_groupMemory[c.key].scans
                 << L" Members=" << c.members.size()
                 << L"\n";
+        }
+
+        if (!soloThresholdMembers.empty()) {
+            overflowLog << L"\n[" << TimeNow() << L"] PID=" << pid << L" Process=" << processName
+                << L" SoloThresholdThreads=" << soloThresholdMembers.size()
+                << L" Reason=thread_already_reaches_threshold_not_group_candidate\n";
+            for (size_t idx : soloThresholdMembers) {
+                const auto& r = rows[idx];
+                overflowLog << L"  TID=" << r.tid
+                    << L" Symbol=" << r.symbol
+                    << L" Module=" << r.module
+                    << L" CyclesDelta=" << r.cyclesDelta
+                    << L" Share=" << std::fixed << std::setprecision(2) << r.cyclesShare << L"%\n";
+            }
+            overflowLog.flush();
         }
 
         if (!overflowMembers.empty()) {
