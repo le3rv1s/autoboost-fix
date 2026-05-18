@@ -25,12 +25,14 @@ using KPRIORITY_T = LONG;
 
 using NtQuerySystemInformation_t = NTSTATUS_T(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
 using NtQueryVirtualMemory_t = NTSTATUS_T(NTAPI*)(HANDLE, PVOID, ULONG, PVOID, SIZE_T, PSIZE_T);
+using NtQueryInformationThread_t = NTSTATUS_T(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
 using SetThreadDescription_t = HRESULT(WINAPI*)(HANDLE, PCWSTR);
 using GetThreadDescription_t = HRESULT(WINAPI*)(HANDLE, PWSTR*);
 
 static constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH_VALUE = static_cast<NTSTATUS_T>(0xC0000004L);
 static constexpr ULONG SYSTEM_PROCESS_INFORMATION_CLASS = 5;
 static constexpr ULONG MEMORY_SECTION_NAME_CLASS = 2;
+static constexpr ULONG THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS = 9;
 static constexpr double TOPG_THRESHOLD = 15.0;
 static constexpr size_t MIN_THREADS_PER_GROUP = 2;
 static constexpr size_t MAX_THREADS_PER_GROUP = 5;
@@ -43,6 +45,10 @@ static constexpr wchar_t TARGET_GAME[] = L"SNB.exe";
 
 #ifndef THREAD_SET_LIMITED_INFORMATION
 #define THREAD_SET_LIMITED_INFORMATION 0x0400
+#endif
+
+#ifndef THREAD_QUERY_INFORMATION
+#define THREAD_QUERY_INFORMATION 0x0040
 #endif
 
 // =========================================================
@@ -152,6 +158,7 @@ struct GroupChunk {
 
 static NtQuerySystemInformation_t g_NtQuerySystemInformation = nullptr;
 static NtQueryVirtualMemory_t g_NtQueryVirtualMemory = nullptr;
+static NtQueryInformationThread_t g_NtQueryInformationThread = nullptr;
 static SetThreadDescription_t g_SetThreadDescription = nullptr;
 static GetThreadDescription_t g_GetThreadDescription = nullptr;
 
@@ -287,6 +294,8 @@ bool InitNt() {
         GetProcAddress(ntdll, "NtQuerySystemInformation"));
     g_NtQueryVirtualMemory = reinterpret_cast<NtQueryVirtualMemory_t>(
         GetProcAddress(ntdll, "NtQueryVirtualMemory"));
+    g_NtQueryInformationThread = reinterpret_cast<NtQueryInformationThread_t>(
+        GetProcAddress(ntdll, "NtQueryInformationThread"));
 
     HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
     if (kernel32) {
@@ -297,7 +306,8 @@ bool InitNt() {
     }
 
     return g_NtQuerySystemInformation != nullptr &&
-        g_NtQueryVirtualMemory != nullptr;
+        g_NtQueryVirtualMemory != nullptr &&
+        g_NtQueryInformationThread != nullptr;
 }
 
 bool QueryProcesses(std::vector<BYTE>& buffer) {
@@ -428,6 +438,42 @@ ULONGLONG GetThreadCycles(DWORD tid) {
     }
 
     return static_cast<ULONGLONG>(cycles);
+}
+
+uintptr_t GetThreadWin32StartAddress(DWORD tid, uintptr_t fallbackAddress) {
+    if (!g_NtQueryInformationThread) {
+        return fallbackAddress;
+    }
+
+    PVOID startAddress = nullptr;
+    HANDLE hThread = GetCachedThreadHandle(tid);
+    if (hThread) {
+        NTSTATUS_T status = g_NtQueryInformationThread(
+            hThread,
+            THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS,
+            &startAddress,
+            sizeof(startAddress),
+            nullptr);
+        if (status >= 0 && startAddress) {
+            return reinterpret_cast<uintptr_t>(startAddress);
+        }
+    }
+
+    HANDLE queryThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (queryThread) {
+        NTSTATUS_T status = g_NtQueryInformationThread(
+            queryThread,
+            THREAD_QUERY_SET_WIN32_START_ADDRESS_CLASS,
+            &startAddress,
+            sizeof(startAddress),
+            nullptr);
+        CloseHandle(queryThread);
+        if (status >= 0 && startAddress) {
+            return reinterpret_cast<uintptr_t>(startAddress);
+        }
+    }
+
+    return fallbackAddress;
 }
 
 std::wstring FormatHex(uintptr_t value) {
@@ -676,7 +722,8 @@ int wmain() {
             g_previous[tid] = { cyclesNow };
             totalCyclesDelta += cyclesDelta;
 
-            const uintptr_t startAddress = reinterpret_cast<uintptr_t>(t.StartAddress);
+            const uintptr_t systemStartAddress = reinterpret_cast<uintptr_t>(t.StartAddress);
+            const uintptr_t startAddress = GetThreadWin32StartAddress(tid, systemStartAddress);
             std::wstring module = Trim(QuerySectionName(hProcess, startAddress));
             std::wstring symbol = BuildStartAddressSymbol(hProcess, module, startAddress);
 
