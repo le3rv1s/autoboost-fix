@@ -38,6 +38,8 @@ static constexpr size_t MIN_THREADS_PER_GROUP = 3;
 static constexpr size_t MAX_THREADS_PER_GROUP = 5;
 static constexpr auto SAMPLE_INTERVAL = std::chrono::seconds(1);
 static constexpr wchar_t TARGET_GAME[] = L"SNB.exe";
+static constexpr size_t GROUP_MEMORY_SCANS = 50;
+static constexpr size_t GROUP_MEMORY_REQUIRED_HITS = 35;
 
 #ifndef THREAD_QUERY_LIMITED_INFORMATION
 #define THREAD_QUERY_LIMITED_INFORMATION 0x0800
@@ -147,14 +149,24 @@ struct GroupBucket {
 };
 
 struct GroupChunk {
+    std::wstring key;
     std::wstring symbol;
     std::wstring module;
     std::vector<size_t> members;
     ULONGLONG cyclesDeltaSum = 0;
     double share = 0.0;
     size_t groupNo = 0;
+    bool thresholdHit = false;
     bool white = false;
+    bool rejected = false;
     std::wstring label;
+};
+
+struct GroupMemory {
+    size_t scans = 0;
+    size_t thresholdHits = 0;
+    bool confirmedWhite = false;
+    bool rejected = false;
 };
 
 static NtQuerySystemInformation_t g_NtQuerySystemInformation = nullptr;
@@ -166,6 +178,7 @@ static GetThreadDescription_t g_GetThreadDescription = nullptr;
 static std::unordered_map<DWORD, Snapshot> g_previous;
 static std::unordered_map<DWORD, ThreadCacheEntry> g_threadCache;
 static std::unordered_map<uintptr_t, std::wstring> g_moduleCache;
+static std::unordered_map<std::wstring, GroupMemory> g_groupMemory;
 
 // =========================================================
 // HELPERS
@@ -580,6 +593,7 @@ DWORD GetForegroundPid() {
 }
 
 std::vector<size_t> BuildGroupFromBucket(
+    const std::wstring& bucketKey,
     const GroupBucket& bucket,
     const std::vector<ThreadRow>& rows,
     ULONGLONG totalCyclesDelta,
@@ -601,6 +615,7 @@ std::vector<size_t> BuildGroupFromBucket(
     const size_t groupSize = std::min(ordered.size(), MAX_THREADS_PER_GROUP);
 
     GroupChunk chunk;
+    chunk.key = bucketKey;
     chunk.symbol = bucket.symbol;
     chunk.module = bucket.module;
     chunk.members.reserve(groupSize);
@@ -615,7 +630,7 @@ std::vector<size_t> BuildGroupFromBucket(
             static_cast<double>(totalCyclesDelta) * 100.0);
     }
 
-    chunk.white = chunk.share >= TOPG_THRESHOLD;
+    chunk.thresholdHit = chunk.share >= TOPG_THRESHOLD;
     outChunks.push_back(std::move(chunk));
 
     if (ordered.size() <= MAX_THREADS_PER_GROUP) {
@@ -681,6 +696,12 @@ int wmain() {
         DWORD pid = 0;
         auto* proc = FindGame(buffer, pid);
         if (!proc) {
+            continue;
+        }
+
+        if (foregroundPid != pid) {
+            ClearCaches();
+            baseline = false;
             continue;
         }
 
@@ -772,13 +793,38 @@ int wmain() {
 
         std::vector<size_t> overflowMembers;
         for (const auto& kv : buckets) {
-            std::vector<size_t> extras = BuildGroupFromBucket(kv.second, rows, totalCyclesDelta, chunks);
+            std::vector<size_t> extras = BuildGroupFromBucket(kv.first, kv.second, rows, totalCyclesDelta, chunks);
             overflowMembers.insert(overflowMembers.end(), extras.begin(), extras.end());
+        }
+
+        for (auto& chunk : chunks) {
+            auto& memory = g_groupMemory[chunk.key];
+            if (!memory.confirmedWhite && !memory.rejected) {
+                ++memory.scans;
+                if (chunk.thresholdHit) {
+                    ++memory.thresholdHits;
+                }
+
+                if (memory.scans >= GROUP_MEMORY_SCANS) {
+                    if (memory.thresholdHits >= GROUP_MEMORY_REQUIRED_HITS) {
+                        memory.confirmedWhite = true;
+                    }
+                    else {
+                        memory.rejected = true;
+                    }
+                }
+            }
+
+            chunk.white = memory.confirmedWhite;
+            chunk.rejected = memory.rejected;
         }
 
         std::sort(chunks.begin(), chunks.end(), [](const GroupChunk& a, const GroupChunk& b) {
             if (a.white != b.white) {
                 return a.white > b.white;
+            }
+            if (a.rejected != b.rejected) {
+                return a.rejected < b.rejected;
             }
             if (a.share != b.share) {
                 return a.share > b.share;
@@ -804,26 +850,13 @@ int wmain() {
                     SetThreadName(rows[idx].tid, chunk.label);
                 }
             }
-            else {
-                chunk.label = L"TopGBlackWorker/" + std::to_wstring(chunk.groupNo);
+            else if (chunk.rejected) {
+                chunk.label = L"BadGroupWorker";
                 for (size_t idx : chunk.members) {
                     rows[idx].white = false;
                     rows[idx].label = chunk.label;
                     SetThreadName(rows[idx].tid, chunk.label);
                 }
-            }
-        }
-
-        for (size_t idx : overflowMembers) {
-            rows[idx].white = false;
-            rows[idx].label = L"TopGBlackWorker/Overflow";
-            SetThreadName(rows[idx].tid, rows[idx].label);
-        }
-
-        for (auto& row : rows) {
-            if (row.label.empty()) {
-                row.label = L"TopGBlackWorker/Ungrouped";
-                SetThreadName(row.tid, row.label);
             }
         }
 
@@ -847,13 +880,15 @@ int wmain() {
             << L" threads per group, same start-address symbol+module):\n";
         for (const auto& c : chunks) {
             log << L"  "
-                << (c.white ? L"TopGWhiteWorker" : L"TopGBlackWorker")
+                << (c.white ? L"TopGWhiteWorker" : (c.rejected ? L"BadGroupWorker" : L"CandidateGroupWorker"))
                 << L" GroupNo=" << c.groupNo
                 << L" Label=" << c.label
                 << L" Symbol=" << c.symbol
                 << L" Module=" << c.module
                 << L" CyclesSum=" << c.cyclesDeltaSum
                 << L" Share=" << std::fixed << std::setprecision(2) << c.share << L"%"
+                << L" ThresholdHit=" << (c.thresholdHit ? L"YES" : L"NO")
+                << L" Memory=" << g_groupMemory[c.key].thresholdHits << L"/" << g_groupMemory[c.key].scans
                 << L" Members=" << c.members.size()
                 << L"\n";
         }
