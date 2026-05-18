@@ -32,7 +32,8 @@ static constexpr NTSTATUS_T STATUS_INFO_LENGTH_MISMATCH_VALUE = static_cast<NTST
 static constexpr ULONG SYSTEM_PROCESS_INFORMATION_CLASS = 5;
 static constexpr ULONG MEMORY_SECTION_NAME_CLASS = 2;
 static constexpr double TOPG_THRESHOLD = 15.0;
-static constexpr size_t THREADS_PER_GROUP = 3;
+static constexpr size_t MIN_THREADS_PER_GROUP = 2;
+static constexpr size_t MAX_THREADS_PER_GROUP = 5;
 static constexpr auto SAMPLE_INTERVAL = std::chrono::seconds(1);
 static constexpr wchar_t TARGET_GAME[] = L"SNB.exe";
 
@@ -178,6 +179,42 @@ std::wstring TimeNow() {
     return buffer;
 }
 
+
+std::wstring GetDesktopPath() {
+    wchar_t path[MAX_PATH]{};
+    HRESULT hr = SHGetFolderPathW(
+        nullptr,
+        CSIDL_DESKTOPDIRECTORY | CSIDL_FLAG_CREATE,
+        nullptr,
+        SHGFP_TYPE_CURRENT,
+        path);
+
+    if (SUCCEEDED(hr) && path[0] != L'\0') {
+        return path;
+    }
+
+    wchar_t currentDir[MAX_PATH]{};
+    DWORD len = GetCurrentDirectoryW(MAX_PATH, currentDir);
+    if (len > 0 && len < MAX_PATH) {
+        return currentDir;
+    }
+
+    return L".";
+}
+
+std::wstring JoinPath(const std::wstring& dir, const std::wstring& file) {
+    if (dir.empty()) {
+        return file;
+    }
+
+    wchar_t last = dir.back();
+    if (last == L'\\' || last == L'/') {
+        return dir + file;
+    }
+
+    return dir + L"\\" + file;
+}
+
 std::wstring Trim(const std::wstring& s) {
     size_t start = 0;
     while (start < s.size() && iswspace(s[start])) {
@@ -219,11 +256,25 @@ bool StartsWithI(const std::wstring& text, const std::wstring& prefix) {
 std::wstring NormalizeSymbol(const std::wstring& s) {
     std::wstring out = Trim(s);
 
-    if (out.empty() || StartsWithI(out, L"TopGWhiteWorker/") || StartsWithI(out, L"TopGBlackWorker/")) {
+    if (out.empty()) {
         return L"-";
     }
 
-    return out;
+    if (StartsWithI(out, L"TopGWhiteWorker/") || StartsWithI(out, L"TopGBlackWorker/")) {
+        return out;
+    }
+
+    while (!out.empty() && iswdigit(out.back())) {
+        out.pop_back();
+    }
+
+    while (!out.empty() &&
+        (out.back() == L'/' || out.back() == L'_' || out.back() == L'-' || iswspace(out.back()))) {
+        out.pop_back();
+    }
+
+    out = Trim(out);
+    return out.empty() ? L"-" : out;
 }
 
 bool InitNt() {
@@ -457,37 +508,47 @@ DWORD GetForegroundPid() {
     return pid;
 }
 
-void BuildExactTriplesFromBucket(
+std::vector<size_t> BuildGroupFromBucket(
     const GroupBucket& bucket,
     const std::vector<ThreadRow>& rows,
     ULONGLONG totalCyclesDelta,
     std::vector<GroupChunk>& outChunks) {
     std::vector<size_t> ordered = bucket.members;
 
-    // Stable, deterministic order: do not sort by live CPU usage, otherwise triplets reshuffle randomly each sample.
+    // Stable, deterministic order: do not sort by live CPU usage, otherwise groups reshuffle randomly each sample.
     std::sort(ordered.begin(), ordered.end(), [&](size_t a, size_t b) {
         return rows[a].tid < rows[b].tid;
     });
 
-    for (size_t start = 0; start + THREADS_PER_GROUP <= ordered.size(); start += THREADS_PER_GROUP) {
-        GroupChunk chunk;
-        chunk.symbol = bucket.symbol;
-        chunk.module = bucket.module;
-        chunk.members.reserve(THREADS_PER_GROUP);
-
-        for (size_t i = start; i < start + THREADS_PER_GROUP; ++i) {
-            chunk.members.push_back(ordered[i]);
-            chunk.cyclesDeltaSum += rows[ordered[i]].cyclesDelta;
-        }
-
-        if (totalCyclesDelta > 0) {
-            chunk.share = Clamp100(static_cast<double>(chunk.cyclesDeltaSum) /
-                static_cast<double>(totalCyclesDelta) * 100.0);
-        }
-
-        chunk.white = chunk.share >= TOPG_THRESHOLD;
-        outChunks.push_back(std::move(chunk));
+    if (ordered.size() < MIN_THREADS_PER_GROUP) {
+        return {};
     }
+
+    const size_t groupSize = std::min(ordered.size(), MAX_THREADS_PER_GROUP);
+
+    GroupChunk chunk;
+    chunk.symbol = bucket.symbol;
+    chunk.module = bucket.module;
+    chunk.members.reserve(groupSize);
+
+    for (size_t i = 0; i < groupSize; ++i) {
+        chunk.members.push_back(ordered[i]);
+        chunk.cyclesDeltaSum += rows[ordered[i]].cyclesDelta;
+    }
+
+    if (totalCyclesDelta > 0) {
+        chunk.share = Clamp100(static_cast<double>(chunk.cyclesDeltaSum) /
+            static_cast<double>(totalCyclesDelta) * 100.0);
+    }
+
+    chunk.white = chunk.share >= TOPG_THRESHOLD;
+    outChunks.push_back(std::move(chunk));
+
+    if (ordered.size() <= MAX_THREADS_PER_GROUP) {
+        return {};
+    }
+
+    return std::vector<size_t>(ordered.begin() + MAX_THREADS_PER_GROUP, ordered.end());
 }
 
 int wmain() {
@@ -496,17 +557,33 @@ int wmain() {
         return 1;
     }
 
-    std::wofstream log(L"topg_log.txt", std::ios::app);
+    const std::wstring desktopPath = GetDesktopPath();
+    const std::wstring logPath = JoinPath(desktopPath, L"topg_log.txt");
+    const std::wstring overflowLogPath = JoinPath(desktopPath, L"topg_overflow_log.txt");
+
+    std::wofstream log(logPath, std::ios::app);
     if (!log.is_open()) {
-        std::wcerr << L"log open failed\n";
+        std::wcerr << L"log open failed: " << logPath << L"\n";
+        return 1;
+    }
+
+    std::wofstream overflowLog(overflowLogPath, std::ios::app);
+    if (!overflowLog.is_open()) {
+        std::wcerr << L"overflow log open failed: " << overflowLogPath << L"\n";
         return 1;
     }
 
     bool baseline = false;
     DWORD lastForegroundPid = 0;
 
-    log << L"=== TopG detector started " << TimeNow() << L" target=" << TARGET_GAME << L" ===\n";
+    log << L"=== TopG detector started " << TimeNow() << L" target=" << TARGET_GAME
+        << L" log=" << logPath << L" overflow_log=" << overflowLogPath << L" ===\n";
+    overflowLog << L"=== TopG overflow log started " << TimeNow() << L" target=" << TARGET_GAME << L" ===\n";
     log.flush();
+    overflowLog.flush();
+
+    std::wcout << L"TopG log: " << logPath << L"\n";
+    std::wcout << L"TopG overflow log: " << overflowLogPath << L"\n";
 
     while (true) {
         std::this_thread::sleep_for(SAMPLE_INTERVAL);
@@ -615,10 +692,12 @@ int wmain() {
         }
 
         std::vector<GroupChunk> chunks;
-        chunks.reserve(rows.size() / THREADS_PER_GROUP);
+        chunks.reserve(rows.size());
 
+        std::vector<size_t> overflowMembers;
         for (const auto& kv : buckets) {
-            BuildExactTriplesFromBucket(kv.second, rows, totalCyclesDelta, chunks);
+            std::vector<size_t> extras = BuildGroupFromBucket(kv.second, rows, totalCyclesDelta, chunks);
+            overflowMembers.insert(overflowMembers.end(), extras.begin(), extras.end());
         }
 
         std::sort(chunks.begin(), chunks.end(), [](const GroupChunk& a, const GroupChunk& b) {
@@ -674,7 +753,8 @@ int wmain() {
 
         log << L"\n[" << TimeNow() << L"] PID=" << pid << L" Process=" << processName << L"\n";
 
-        log << L"Groups (exactly " << THREADS_PER_GROUP << L" threads per group):\n";
+        log << L"Groups (" << MIN_THREADS_PER_GROUP << L".." << MAX_THREADS_PER_GROUP
+            << L" threads per group, same symbol+module):\n";
         for (const auto& c : chunks) {
             log << L"  "
                 << (c.white ? L"TopGWhiteWorker" : L"TopGBlackWorker")
@@ -685,6 +765,21 @@ int wmain() {
                 << L" Share=" << std::fixed << std::setprecision(2) << c.share << L"%"
                 << L" Members=" << c.members.size()
                 << L"\n";
+        }
+
+        if (!overflowMembers.empty()) {
+            overflowLog << L"\n[" << TimeNow() << L"] PID=" << pid << L" Process=" << processName
+                << L" OverflowThreads=" << overflowMembers.size()
+                << L" Reason=more_than_" << MAX_THREADS_PER_GROUP << L"_with_same_symbol_module\n";
+            for (size_t idx : overflowMembers) {
+                const auto& r = rows[idx];
+                overflowLog << L"  TID=" << r.tid
+                    << L" Symbol=" << r.symbol
+                    << L" Module=" << r.module
+                    << L" CyclesDelta=" << r.cyclesDelta
+                    << L" Share=" << std::fixed << std::setprecision(2) << r.cyclesShare << L"%\n";
+            }
+            overflowLog.flush();
         }
 
         log << L"Threads:\n";
