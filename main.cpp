@@ -297,8 +297,7 @@ bool InitNt() {
     }
 
     return g_NtQuerySystemInformation != nullptr &&
-        g_NtQueryVirtualMemory != nullptr &&
-        g_GetThreadDescription != nullptr;
+        g_NtQueryVirtualMemory != nullptr;
 }
 
 bool QueryProcesses(std::vector<BYTE>& buffer) {
@@ -431,6 +430,12 @@ ULONGLONG GetThreadCycles(DWORD tid) {
     return static_cast<ULONGLONG>(cycles);
 }
 
+std::wstring FormatHex(uintptr_t value) {
+    wchar_t buffer[32]{};
+    swprintf_s(buffer, L"0x%llx", static_cast<unsigned long long>(value));
+    return buffer;
+}
+
 std::wstring QuerySectionName(HANDLE hProcess, uintptr_t address) {
     auto it = g_moduleCache.find(address);
     if (it != g_moduleCache.end()) {
@@ -483,6 +488,25 @@ std::wstring QuerySectionName(HANDLE hProcess, uintptr_t address) {
 
     g_moduleCache[address] = module;
     return module;
+}
+
+std::wstring BuildStartAddressSymbol(HANDLE hProcess, const std::wstring& module, uintptr_t address) {
+    if (module.empty() || module == L"-" || address == 0) {
+        return L"-";
+    }
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == 0 ||
+        mbi.AllocationBase == nullptr) {
+        return module + L"!" + FormatHex(address);
+    }
+
+    const uintptr_t moduleBase = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+    if (address < moduleBase) {
+        return module + L"!" + FormatHex(address);
+    }
+
+    return module + L"!+" + FormatHex(address - moduleBase);
 }
 
 void ClearCaches() {
@@ -652,8 +676,9 @@ int wmain() {
             g_previous[tid] = { cyclesNow };
             totalCyclesDelta += cyclesDelta;
 
-            std::wstring symbol = Trim(GetThreadOriginalSymbolCached(tid));
-            std::wstring module = Trim(QuerySectionName(hProcess, reinterpret_cast<uintptr_t>(t.StartAddress)));
+            const uintptr_t startAddress = reinterpret_cast<uintptr_t>(t.StartAddress);
+            std::wstring module = Trim(QuerySectionName(hProcess, startAddress));
+            std::wstring symbol = BuildStartAddressSymbol(hProcess, module, startAddress);
 
             rows.push_back({ tid, symbol, module, cyclesDelta, 0.0, false, L"" });
         }
@@ -665,7 +690,7 @@ int wmain() {
             }
         }
 
-        // Exact grouping by SAME symbol + SAME module only. Unresolved names/modules are isolated.
+        // Exact grouping by SAME start-address symbol + SAME module only. Thread names/descriptions are not used for grouping.
         std::unordered_map<std::wstring, GroupBucket> buckets;
         buckets.reserve(rows.size());
 
@@ -754,7 +779,7 @@ int wmain() {
         log << L"\n[" << TimeNow() << L"] PID=" << pid << L" Process=" << processName << L"\n";
 
         log << L"Groups (" << MIN_THREADS_PER_GROUP << L".." << MAX_THREADS_PER_GROUP
-            << L" threads per group, same symbol+module):\n";
+            << L" threads per group, same start-address symbol+module):\n";
         for (const auto& c : chunks) {
             log << L"  "
                 << (c.white ? L"TopGWhiteWorker" : L"TopGBlackWorker")
